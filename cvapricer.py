@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="CVA – Multi-CCY with CDS Bootstrap (Hull–White 1F)", layout="wide")
-st.title("💳 CVA – IRS (USD / EUR / GBP / CAD) – Hull–White 1F rates + CDS hazard bootstrap")
+st.set_page_config(page_title="CVA Multi-CCY)", layout="wide")
+st.title("CVA PRICER by A.Rottino")
 
 # -----------------------------
 # Currency presets (baseline params & fixed-leg conventions)
