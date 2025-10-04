@@ -1,23 +1,23 @@
-# cvapricer_multi_ccy_cva_cds.py
+# cvapricer_multi_ccy_cva_cds_hw.py
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="CVA – Multi-CCY with CDS Bootstrap (Flat Curve, Simple MC)", layout="wide")
-st.title("💳 CVA – IRS (USD / EUR / GBP / CAD) – Flat curve MC + CDS hazard bootstrap")
+st.set_page_config(page_title="CVA – Multi-CCY with CDS Bootstrap (Hull–White 1F)", layout="wide")
+st.title("💳 CVA – IRS (USD / EUR / GBP / CAD) – Hull–White 1F rates + CDS hazard bootstrap")
 
 # -----------------------------
 # Currency presets (baseline params & fixed-leg conventions)
 # -----------------------------
 CCY_PRESETS = {
     "USD": {"symbol": "$",  "fixed_freq": 2, "fixed_dcc": "30/360 US",
-            "r0": 0.030, "sigma": 0.010, "hazard": 0.020, "LGD": 0.60},
+            "r0": 0.030, "a": 0.05, "sigma": 0.010, "hazard": 0.020, "LGD": 0.60},
     "EUR": {"symbol": "€",  "fixed_freq": 1, "fixed_dcc": "30E/360",
-            "r0": 0.020, "sigma": 0.010, "hazard": 0.020, "LGD": 0.60},
+            "r0": 0.020, "a": 0.05, "sigma": 0.010, "hazard": 0.020, "LGD": 0.60},
     "GBP": {"symbol": "£",  "fixed_freq": 2, "fixed_dcc": "ACT/365F",
-            "r0": 0.035, "sigma": 0.012, "hazard": 0.020, "LGD": 0.60},
+            "r0": 0.035, "a": 0.05, "sigma": 0.012, "hazard": 0.020, "LGD": 0.60},
     "CAD": {"symbol": "C$", "fixed_freq": 2, "fixed_dcc": "ACT/365F",
-            "r0": 0.030, "sigma": 0.011, "hazard": 0.020, "LGD": 0.60},
+            "r0": 0.030, "a": 0.05, "sigma": 0.011, "hazard": 0.020, "LGD": 0.60},
 }
 
 # -----------------------------
@@ -38,33 +38,51 @@ with st.sidebar:
     fixed_dcc = st.selectbox("Fixed day count (label)", ["30/360 US", "30E/360", "ACT/365F"],
                              index=["30/360 US","30E/360","ACT/365F"].index(p["fixed_dcc"]))
     fixed_rate = st.number_input("Fixed rate K (decimal)", 0.0, 1.0, 0.03, step=0.0005, format="%.4f")
-    st.caption("In this pedagogical grid, accrual τ ≈ 1/frequency (we don't compute exact day counts).")
+    st.caption("Accrual τ ≈ 1/frequency (simple grid).")
 
-    st.header("Market (flat short rate curve)")
-    r0 = st.number_input("Initial rate r₀", -1.0, 1.0, float(p["r0"]), step=0.0005, format="%.4f")
-    sigma = st.number_input("Rate vol σ", 0.0001, 2.0, float(p["sigma"]), step=0.0005, format="%.4f")
+    st.header("Initial discount curve (for HW fit)")
+    curve_mode = st.radio("Curve input", ["Flat r₀", "Custom zero curve"], index=0)
+    if curve_mode == "Flat r₀":
+        r0 = st.number_input("Flat short rate r₀", -1.0, 1.0, float(p["r0"]), step=0.0005, format="%.4f")
+        zero_times = [0.0, maturity]
+        zero_rates = [r0, r0]
+    else:
+        st.caption("Enter comma-separated year tenors and matching zero rates (decimals).")
+        zero_times_str = st.text_input("Zero tenors (years)", "0,1,2,5,10,30")
+        zero_rates_str = st.text_input("Zero rates (decimals)", "0.02,0.022,0.023,0.024,0.025,0.026")
+        def parse_csv_floats(s): return [float(x.strip()) for x in s.split(",") if x.strip()]
+        try:
+            zero_times = parse_csv_floats(zero_times_str)
+            zero_rates = parse_csv_floats(zero_rates_str)
+        except Exception as e:
+            st.error(f"Parse error for zero curve: {e}")
+            st.stop()
+        if len(zero_times) != len(zero_rates) or len(zero_times) < 2:
+            st.error("Zero curve lists must have same length (≥2).")
+            st.stop()
+        r0 = float(zero_rates[0])
+
+    st.header("Hull–White (1F)")
+    a = st.number_input("Mean reversion a", 0.0001, 2.0, float(p["a"]), step=0.005, format="%.4f")
+    sigma = st.number_input("Volatility σ", 0.0001, 2.0, float(p["sigma"]), step=0.0005, format="%.4f")
 
     st.header("Counterparty credit (CVA)")
     credit_mode = st.radio("Credit input", ["Constant hazard λ", "CDS curve bootstrap"], index=1)
-
     if credit_mode == "Constant hazard λ":
         hazard = st.number_input("Hazard rate λ (annual)", 0.0001, 1.0, float(p["hazard"]), step=0.0005, format="%.4f")
         LGD = st.number_input("LGD", 0.0, 1.0, float(p["LGD"]), step=0.05)
-        recovery = 1.0 - LGD  # informational
+        recovery = 1.0 - LGD
     else:
         LGD = st.number_input("LGD", 0.0, 1.0, float(p["LGD"]), step=0.05)
         recovery = st.number_input("Recovery R (decimal)", 0.0, 1.0, 0.40, step=0.05, format="%.2f")
-        st.caption("Enter CDS tenors and spreads (bps). Bootstrap uses quarterly premium payments.")
+        st.caption("Enter CDS tenors and spreads (bps). Quarterly premium payments.")
         cds_tenors_str = st.text_input("CDS tenors (years)", "1,3,5,7,10")
         cds_spreads_str = st.text_input("CDS spreads (bps)", "80,100,120,140,160")
 
     st.header("Simulation")
-    n_paths = st.number_input("Monte Carlo paths", 1000, 500000, 50000, step=1000)
-    seed = st.number_input("Random seed", 0, 10**9, 42)
+    n_paths = st.number_input("Monte Carlo paths", 1000, 300000, 50000, step=1000)
+    seed = st.number_input("Random seed", 0, 10**9, 123)
     show_paths = st.slider("Show N rate paths", 1, 200, 50)
-    clip_rates = st.checkbox("Clip simulated rates (avoid extremes)", value=True)
-    r_min = st.number_input("Min rate clip", -1.0, 1.0, -0.05, step=0.005, format="%.3f", disabled=not clip_rates)
-    r_max = st.number_input("Max rate clip", -1.0, 1.0, 0.20, step=0.005, format="%.3f", disabled=not clip_rates)
 
     st.header("Charts & Stats")
     show_epe_percentiles = st.checkbox("Show EPE percentiles (5/25/50/75/95)", value=True)
@@ -72,30 +90,75 @@ with st.sidebar:
     compute_btn = st.button("Run CVA")
 
 st.markdown(
-    "> **Model**: flat curve at r₀; short rate is Brownian on the fixed-leg grid (Δt = 1/frequency). "
-    "Exposure uses a simple IRS proxy with DF(t,t+mΔt)=exp(-r_t·m·Δt). Credit is either constant λ or "
-    "bootstrapped piecewise hazard from CDS (quarterly payments, risky PV01 vs protection)."
+    "> **Model**: Hull–White 1F short rate fitted to your initial curve; pathwise DF from the rate integral. "
+    "Credit is either constant λ or CDS-bootstrapped hazards (quarterly premiums). IRS exposure uses DF from HW paths."
 )
 
 # -----------------------------
-# Utilities
+# Curve helpers
 # -----------------------------
-def parse_csv_floats(s):
-    return [float(x.strip()) for x in s.split(",") if x.strip() != ""]
+def interp_zero(times, zeros):
+    times = np.array(times, float); zeros = np.array(zeros, float)
+    def z(t):
+        t = float(t)
+        if t <= times[0]: return float(zeros[0])
+        if t >= times[-1]: return float(zeros[-1])
+        i = np.searchsorted(times, t) - 1
+        t0,t1 = times[i], times[i+1]; z0,z1 = zeros[i], zeros[i+1]
+        w = (t - t0)/(t1 - t0)
+        return float(z0*(1-w) + z1*w)
+    return z
 
-def df0_flat(r0):
-    return lambda t: float(np.exp(-r0 * float(t)))
+def forward_from_zero(times, zeros):
+    z = interp_zero(times, zeros)
+    def f0(t, h=1e-5):
+        # instantaneous forward f(0,t) ≈ z(t) + t z'(t)
+        zt = z(t); zp = (z(t+h)-z(t-h))/(2*h)
+        return float(zt + t*zp)
+    return f0
+
+def df0_from_zero(times, zeros):
+    z = interp_zero(times, zeros)
+    return lambda t: float(np.exp(-z(t)*t))
 
 # -----------------------------
-# CDS Bootstrap (piecewise-constant hazard)
+# Hull–White 1F
 # -----------------------------
+def theta_from_f0_grid(grid, a, sigma, f0):
+    h = 1e-4
+    dfdt = (np.array([f0(t+h) for t in grid]) - np.array([f0(t-h) for t in grid]))/(2*h)
+    return dfdt + a*np.array([f0(t) for t in grid]) + (sigma**2/(2*a))*(1.0 - np.exp(-2*a*grid))
+
+def simulate_hw_paths(a, sigma, f0, T, dt, n_paths, seed=123):
+    n_steps = int(np.ceil(T/dt))
+    grid = np.linspace(0.0, n_steps*dt, n_steps+1)  # include t=0
+    rng = np.random.default_rng(int(seed))
+    r = np.zeros((n_paths, n_steps+1))
+    r[:,0] = f0(1e-6)
+    A = np.zeros_like(r)  # integral A_t
+
+    theta_vals = theta_from_f0_grid(grid, a, sigma, f0)
+    for k in range(n_steps):
+        dW = rng.standard_normal(n_paths)*np.sqrt(dt)
+        drift = theta_vals[k] - a*r[:,k]
+        r[:,k+1] = r[:,k] + drift*dt + sigma*dW
+        A[:,k+1] = A[:,k] + 0.5*(r[:,k] + r[:,k+1])*dt  # trapezoid
+
+    return grid, r, A
+
+def df_path(A, idx_from, idx_to):
+    return np.exp(-(A[:, idx_to] - A[:, idx_from]))
+
+# -----------------------------
+# CDS bootstrap (piecewise-constant hazards)
+# -----------------------------
+def parse_csv_floats(s): return [float(x.strip()) for x in s.split(",") if x.strip()]
+
 def cds_pay_grid(T, pay_freq=4):
-    """Quarterly payment dates 0..T (inclusive)."""
     n = int(np.round(T * pay_freq))
-    return np.linspace(0.0, T, n + 1)
+    return np.linspace(0.0, T, n+1)
 
 def cds_leg_rpv01(times_pay, df0, S):
-    """Risky PV01: sum tau * DF(0,t_i) * S(t_i)."""
     rpv01 = 0.0
     for i in range(1, len(times_pay)):
         tau = times_pay[i] - times_pay[i-1]
@@ -104,54 +167,46 @@ def cds_leg_rpv01(times_pay, df0, S):
     return rpv01
 
 def cds_leg_protection(times_pay, df0, S, R):
-    """Protection leg: sum DF(0,t_i) * (S(t_{i-1}) - S(t_i)) * (1-R)."""
     prot = 0.0
     for i in range(1, len(times_pay)):
         t0, t1 = times_pay[i-1], times_pay[i]
         prot += df0(t1) * (S(t0) - S(t1)) * (1.0 - R)
     return prot
 
-def bootstrap_piecewise_hazard(tenors, spreads_bps, df0, R=0.4, pay_freq=4,
-                               max_iter=100, tol=1e-10):
-    """
-    Solve sequentially for λ_i on intervals [T_{i-1},T_i] s.t.
-      spread_i * RPv01_i = Protection_i
-    with S(t) piecewise-constant hazard (stepwise). Extrapolate flat hazard beyond last tenor.
-    Returns hazards list (λ_i for each interval) and survival function S(t).
-    """
-    tenors = np.array(tenors, dtype=float)
-    spreads = np.array(spreads_bps, dtype=float) * 1e-4  # decimal
+def bootstrap_piecewise_hazard(tenors, spreads_bps, df0, R=0.4, pay_freq=4, max_iter=100, tol=1e-10):
+    tenors = np.array(tenors, float)
+    spreads = np.array(spreads_bps, float) * 1e-4
     cut_times = np.concatenate([[0.0], tenors])
     hazards = []
 
-    def S_with_hazards(t, hs):
+    def S_with_hs(t, hs):
         t = np.atleast_1d(t)
         Svals = np.ones_like(t, dtype=float)
         for j in range(1, len(cut_times)):
-            lam = hs[j-1] if j-1 < len(hs) else (hs[-1] if len(hs) > 0 else 0.0)
-            t0, t1 = cut_times[j-1], cut_times[j]
-            dt = np.clip(np.minimum(t, t1) - t0, 0.0, None)
+            lam = hs[j-1] if j-1 < len(hs) else (hs[-1] if len(hs)>0 else 0.0)
+            t0,t1 = cut_times[j-1], cut_times[j]
+            dt = np.clip(np.minimum(t, t1) - t0, 0, None)
             Svals *= np.exp(-lam * dt)
-        if len(hs) > 0:
-            extra = np.clip(t - cut_times[-1], 0.0, None)
+        if len(hs)>0:
+            extra = np.clip(t - cut_times[-1], 0, None)
             Svals *= np.exp(-hs[-1] * extra)
         return Svals if Svals.shape != () else float(Svals)
 
     for i, T in enumerate(tenors):
-        grid = cds_pay_grid(T, pay_freq=pay_freq)
-        S_spread = spreads[i]
+        grid = cds_pay_grid(T, 4)
+        s = spreads[i]
 
-        def eq_for_lambda(lmb):
+        def f_of_lambda(lmb):
             hs_try = hazards + [lmb]
-            S_try = lambda t: S_with_hazards(t, hs_try)
-            return S_spread * cds_leg_rpv01(grid, df0, S_try) - cds_leg_protection(grid, df0, S_try, R)
+            S_try = lambda t: S_with_hs(t, hs_try)
+            return s * cds_leg_rpv01(grid, df0, S_try) - cds_leg_protection(grid, df0, S_try, R)
 
         lo, hi = 1e-8, 5.0
-        f_lo = eq_for_lambda(lo)
+        f_lo = f_of_lambda(lo)
         mid = None
         for _ in range(max_iter):
-            mid = 0.5 * (lo + hi)
-            f_mid = eq_for_lambda(mid)
+            mid = 0.5*(lo+hi)
+            f_mid = f_of_lambda(mid)
             if abs(f_mid) < tol:
                 hazards.append(mid)
                 break
@@ -162,181 +217,173 @@ def bootstrap_piecewise_hazard(tenors, spreads_bps, df0, R=0.4, pay_freq=4,
         else:
             hazards.append(mid if mid is not None else lo)
 
-    S_final = lambda t: S_with_hazards(t, hazards)
+    S_final = lambda t: S_with_hs(t, hazards)
     return hazards, S_final
 
 # -----------------------------
-# Core CVA model (flat curve + simple IRS proxy)
+# Exposure & CVA on HW paths
 # -----------------------------
-def simulate_rates(r0, sigma, T, dt, n_paths, seed=42):
-    """r_t = r0 + σ * ∑ N(0,1) * sqrt(dt) on grid Δt."""
-    n_steps = int(np.ceil(T / dt))
-    grid = np.linspace(dt, n_steps * dt, n_steps)   # t1..tN
-    rng = np.random.default_rng(int(seed))
-    shocks = rng.standard_normal((n_paths, n_steps)) * np.sqrt(dt)
-    rates = r0 + sigma * np.cumsum(shocks, axis=1)
-    return grid, rates  # times shape (n_steps,), rates (n_paths, n_steps)
+def grid_indices_for_payments(grid, pay_times):
+    # nearest indices on HW grid for each payment time
+    idx = np.searchsorted(grid, pay_times, side="left")
+    idx = np.clip(idx, 1, len(grid)-1)  # avoid t=0
+    return idx.tolist()
 
-def swap_value_paths(notional, K, rates, dt, side="payer"):
+def swap_exposure_hw(notional, K, grid, A_paths, pay_times, side="payer"):
     """
-    Pathwise IRS value V_k on grid {t_k}, using flat-at-time r_t per path:
-      DF(t,t+m·dt) = exp(-r_t * m * dt)
-      Float ≈ Σ_m DF * r_t * N * dt
-      Fixed  = Σ_m DF * K   * N * dt
-    side='payer' → value = float - fixed; 'receiver' → fixed - float.
-    Overflow-safe via exponent clipping.
+    Exposure at each HW time k using DF from A_paths:
+      PV_float(t_k) ≈ N * (1 - P(t_k, T_last))
+      PV_fixed(t_k) = N * Σ τ_i * K * P(t_k, t_i) over remaining fixed dates
     """
-    n_paths, n_steps = rates.shape
-    V = np.zeros((n_paths, n_steps))
-    for k in range(n_steps):
-        remaining = n_steps - k
-        if remaining <= 0:
-            break
-        m = np.arange(1, remaining + 1, dtype=float)
-        # Prevent overflow/underflow in exp
-        exp_mat = -np.outer(rates[:, k], m * dt)
-        np.clip(exp_mat, -700.0, 700.0, out=exp_mat)
-        df = np.exp(exp_mat)
-        float_leg = (df * rates[:, k][:, None]).sum(axis=1) * notional * dt
-        fixed_leg = (df * K).sum(axis=1) * notional * dt
-        V[:, k] = (float_leg - fixed_leg) if side == "payer" else (fixed_leg - float_leg)
-    return V
+    n_paths, n_steps_plus = A_paths.shape
+    exposures = np.zeros((n_paths, n_steps_plus))
 
-def exposures_from_values(V):
-    """EPE from positive part only."""
-    pos = np.maximum(V, 0.0)
-    EPE = pos.mean(axis=0)
-    return EPE, pos
+    pay_idx = grid_indices_for_payments(grid, pay_times)
+    last_idx = pay_idx[-1]
 
-def cva_from_EPE_constant_lambda(EPE, r0, hazard, grid, LGD):
-    D = np.exp(-r0 * grid)
-    S = np.exp(-hazard * grid)
-    dPD = np.empty_like(grid)
-    dPD[0] = 1.0 - S[0]
-    dPD[1:] = S[:-1] - S[1:]
-    CVA = LGD * float(np.sum(D * EPE * dPD))
-    return D, S, dPD, CVA
+    for k in range(n_steps_plus):
+        future_idx = [j for j in pay_idx if j > k]
+        if not future_idx:
+            continue
+        # Float leg ≈ N*(1 - P(t_k, T_last))
+        P_t_T = df_path(A_paths, k, last_idx)
+        pv_float = notional * (1.0 - P_t_T)
 
-def cva_from_EPE_bootstrapped(EPE, r0, grid, LGD, S_func):
-    """
-    Use bootstrapped survival S(t) to build discrete default increments on the exposure grid.
-    """
-    D = np.exp(-r0 * grid)
-    S_vals = S_func(grid)
-    dPD = np.empty_like(grid)
+        # Fixed leg
+        pv_fixed = np.zeros(n_paths)
+        prev = k
+        for j in future_idx:
+            tau = grid[j] - grid[prev]
+            df = df_path(A_paths, k, j)
+            pv_fixed += notional * K * tau * df
+            prev = j
+
+        value = (pv_float - pv_fixed) if side=="payer" else (pv_fixed - pv_float)
+        exposures[:, k] = np.maximum(value, 0.0)
+
+    return exposures  # includes t=0 column (k=0)
+
+def cva_from_epe_grid(EPE, df0, S, grid, LGD):
+    # grid includes t=0; drop k=0 for default increment calc
+    t = grid[1:]
+    E = EPE[1:]
+    D = np.array([df0(tt) for tt in t])
+    S_vals = S(t)
+    dPD = np.empty_like(t)
     dPD[0] = 1.0 - S_vals[0]
     dPD[1:] = S_vals[:-1] - S_vals[1:]
-    CVA = LGD * float(np.sum(D * EPE * dPD))
-    return D, S_vals, dPD, CVA
+    CVA = LGD * float(np.sum(D * E * dPD))
+    return CVA, t, E, D, dPD, S_vals
 
 # -----------------------------
 # Run
 # -----------------------------
 if compute_btn:
-    # Time step aligned with fixed-leg frequency
+    # Build curve & forwards for HW fit
+    f0 = forward_from_zero(zero_times, zero_rates)
+    df0 = df0_from_zero(zero_times, zero_rates)
+
+    # HW time step aligned with fixed leg
     dt = 1.0 / float(fixed_freq)
 
-    # Simulate rates
-    grid, rates = simulate_rates(r0, sigma, maturity, dt, n_paths, seed=seed)
-    if clip_rates:
-        rates = np.clip(rates, r_min, r_max)
+    # Simulate HW short-rate & integral
+    grid, r_paths, A_paths = simulate_hw_paths(a, sigma, f0, maturity, dt, n_paths, seed=seed)
 
+    # Build fixed payment schedule on (0,T] with frequency
+    n_pay = int(np.round(maturity * fixed_freq))
+    pay_times = np.linspace(dt, n_pay*dt, n_pay)
+
+    # Payer/Receiver
     side_key = "payer" if side.lower().startswith("payer") else "receiver"
-    V = swap_value_paths(notional, fixed_rate, rates, dt, side=side_key)
-    EPE, paths_pos = exposures_from_values(V)
+
+    # Pathwise exposures using HW discounting
+    exposures = swap_exposure_hw(notional, fixed_rate, grid, A_paths, pay_times, side=side_key)
+    EPE = exposures.mean(axis=0)
 
     # Credit: constant λ or CDS bootstrap
-    df0 = df0_flat(r0)
-
-    hazards_list = None
-    S = None
     if credit_mode == "Constant hazard λ":
-        D, S_vals, dPD, CVA = cva_from_EPE_constant_lambda(EPE, r0, hazard, grid, LGD)
+        S = lambda t: np.exp(-hazard * np.atleast_1d(t))
     else:
-        # Parse CDS inputs
+        # Parse CDS inputs and bootstrap hazards
         try:
             cds_tenors = parse_csv_floats(cds_tenors_str)
             cds_spreads_bps = parse_csv_floats(cds_spreads_str)
         except Exception as e:
             st.error(f"Error parsing CDS inputs: {e}")
             st.stop()
-        if len(cds_tenors) == 0 or len(cds_tenors) != len(cds_spreads_bps):
-            st.error("CDS tenors/spreads must be non-empty and of the same length.")
+        if len(cds_tenors)==0 or len(cds_tenors)!=len(cds_spreads_bps):
+            st.error("CDS tenors/spreads must be non-empty and of equal length.")
             st.stop()
-
         hazards_list, S = bootstrap_piecewise_hazard(cds_tenors, cds_spreads_bps, df0, R=recovery, pay_freq=4)
-        D, S_vals, dPD, CVA = cva_from_EPE_bootstrapped(EPE, r0, grid, LGD, S)
+
+    # CVA on the HW grid (skip t=0)
+    CVA, t_epe, E_epe, D0t, dPD, S_vals = cva_from_epe_grid(EPE, df0, S, grid, LGD)
 
     # -------- Result
     st.subheader("Result")
     st.metric(f"CVA ({ccy})", f"{CVA:,.2f}")
-    if credit_mode == "Constant hazard λ":
-        cred_desc = f"λ: **{hazard:.2%}**, LGD: **{LGD:.0%}** (R≈{1-LGD:.0%})"
-    else:
-        cred_desc = f"CDS bootstrap, LGD: **{LGD:.0%}** (R={recovery:.0%})"
+    cred_desc = (f"λ: **{hazard:.2%}**, LGD: **{LGD:.0%}** (R≈{1-LGD:.0%})"
+                 if credit_mode=="Constant hazard λ"
+                 else f"CDS bootstrap, LGD: **{LGD:.0%}** (R={recovery:.0%})")
     st.caption(
         f"{ccy} {sym} | Side: **{side}** | Notional: **{notional:,.0f}** | K: **{fixed_rate:.4%}** | "
-        f"T: **{maturity:.2f}y** | Freq: **{fixed_freq}x** (τ≈{dt:.3f}) [{fixed_dcc}] | "
-        f"r₀: **{r0:.2%}**, σ: **{sigma:.2%}** | {cred_desc}"
+        f"T: **{maturity:.2f}y** | Fixed freq: **{fixed_freq}x** (τ≈{dt:.3f}) [{fixed_dcc}] | "
+        f"HW: a={a:.3f}, σ={sigma:.3%} | Curve: {'flat' if curve_mode=='Flat r₀' else 'custom zeros'} | {cred_desc}"
     )
 
     # -------- Charts
     c1, c2 = st.columns(2, gap="large")
-
     with c1:
-        st.markdown("**Simulated short-rate paths (subset)**")
-        df_rates = pd.DataFrame({"t": grid})
-        take = min(show_paths, rates.shape[0])
+        st.markdown("**Hull–White short-rate paths (subset)**")
+        # show k>=1 (exclude t=0)
+        t_plot = grid
+        df_rates = pd.DataFrame({"t": t_plot})
+        take = min(show_paths, r_paths.shape[0])
         for i in range(take):
-            df_rates[f"path_{i+1}"] = rates[i]
-        df_rates["mean_rate"] = rates.mean(axis=0)
+            df_rates[f"path_{i+1}"] = r_paths[i]
+        df_rates["mean_rate"] = r_paths.mean(axis=0)
         st.line_chart(df_rates.set_index("t"))
-        st.caption(f"Δt = {dt:.3f} years (aligned to fixed-leg frequency).")
+        st.caption(f"Δt = {dt:.3f} years.")
 
     with c2:
-        st.markdown("**Expected Positive Exposure (EPE)**")
+        st.markdown("**EPE on HW grid**")
         st.line_chart(pd.DataFrame({"t": grid, "EPE": EPE}).set_index("t"))
 
     if show_epe_percentiles:
         st.markdown("**EPE percentiles across paths**")
-        qs_df = pd.DataFrame({"t": grid})
-        qs = np.percentile(paths_pos, [5,25,50,75,95], axis=0)
-        for q, arr in zip([5,25,50,75,95], qs):
-            qs_df[f"p{q}"] = arr
+        pos_paths = np.maximum(exposures, 0.0)
+        qs = np.percentile(pos_paths, [5,25,50,75,95], axis=0)
+        qs_df = pd.DataFrame({"t": grid, "p5": qs[0], "p25": qs[1], "p50": qs[2], "p75": qs[3], "p95": qs[4]})
         st.line_chart(qs_df.set_index("t"))
-        st.dataframe(qs_df, use_container_width=True)
+        st.dataframe(qs_df.iloc[1:], use_container_width=True)  # skip t=0 in table
 
     c3, c4 = st.columns(2, gap="large")
     with c3:
-        st.markdown("**Default increment dPD(t)**")
-        st.area_chart(pd.DataFrame({"t": grid, "dPD": dPD}).set_index("t"))
+        st.markdown("**Default increment dPD(t_k)**")
+        st.area_chart(pd.DataFrame({"t": t_epe, "dPD": dPD}).set_index("t"))
     with c4:
-        st.markdown("**Discount factor D(0,t)**")
-        st.line_chart(pd.DataFrame({"t": grid, "DF": np.exp(-r0 * grid)}).set_index("t"))
+        st.markdown("**Discount factor D(0,t)** (from initial curve)")
+        st.line_chart(pd.DataFrame({"t": t_epe, "DF": D0t}).set_index("t"))
 
-    # For CDS mode: show survival & hazards
     if credit_mode == "CDS curve bootstrap":
         st.subheader("Bootstrapped survival & hazards")
-        surv_df = pd.DataFrame({"t": grid, "Survival S(t)": S_vals})
-        st.line_chart(surv_df.set_index("t"))
-
+        st.line_chart(pd.DataFrame({"t": t_epe, "Survival S(t)": S_vals}).set_index("t"))
         haz_df = pd.DataFrame({"TenorEnd(yrs)": cds_tenors, "Hazard λ_i": hazards_list})
         st.dataframe(haz_df, use_container_width=True)
         st.download_button("⬇️ Download hazards (CSV)", haz_df.to_csv(index=False), file_name=f"hazards_{ccy}.csv")
 
     # -------- Data / download
     st.subheader("CVA data")
-    out = pd.DataFrame({"t": grid, "EPE": EPE, "dPD": dPD, "DF": np.exp(-r0 * grid)})
+    out = pd.DataFrame({"t": t_epe, "EPE": E_epe, "dPD": dPD, "DF": D0t})
     st.dataframe(out, use_container_width=True)
     st.download_button("⬇️ Download EPE/dPD/DF (CSV)", out.to_csv(index=False), file_name=f"cva_data_{ccy}.csv")
 
     with st.expander("Notes / assumptions"):
         st.write(
-            "- **CVA only**. Counterparty default via constant hazard λ or CDS-bootstrapped hazards; LGD supplied.\n"
-            "- Flat discount at r₀; short-rate simulated as Brownian on the fixed-leg grid.\n"
-            "- IRS value uses a simple proxy with DF(t,t+mΔt)=exp(-r_t·m·Δt) and accrual τ≈Δt.\n"
-            "- **CDS bootstrap**: quarterly premium grid; solves S·RPV01 = protection per tenor (piecewise hazard). "
-            "Beyond last tenor, hazard is kept flat (extrapolated)."
+            "- **Rates**: Hull–White 1F with θ(t) fitted to the initial forward curve; pathwise DF from the short-rate integral.\n"
+            "- **Exposure**: float leg ≈ N·(1−P(t,T_last)); fixed leg via pathwise discounting to remaining fixed dates.\n"
+            "- **Credit**: constant hazard λ or CDS-bootstrapped piecewise hazards (quarterly premiums).\n"
+            "- **Curve**: choose flat r₀ or custom zero curve; HW fit uses f(0,t) constructed from the zeros."
         )
 else:
     st.info("Set parameters in the sidebar and click **Run CVA**.")
