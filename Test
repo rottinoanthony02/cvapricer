@@ -1,0 +1,95 @@
+# =========================
+# DÉTAIL QUOTIDIEN — Risk Δ (step risk) et PnL par constituant
+# =========================
+st.markdown("---")
+st.subheader("Détail quotidien — Risk Δ et PnL par constituant")
+
+try:
+    # Driver (Δ du 'dtype') à partir des changements de marché
+    mkt_change_view = build_changes(market_df, FX_COLS)
+    if str(dtype) not in mkt_change_view.columns:
+        st.warning(f"Le driver '{dtype}' n'existe pas dans Market Data pour calculer le Risk Δ.")
+        driver_series = None
+    else:
+        driver_series = mkt_change_view[str(dtype)].copy()
+except Exception as e:
+    st.warning(f"Impossible de construire le driver: {e}")
+    driver_series = None
+
+# Index commun pour la sélection de date
+common_idx = pnl_by_factor.index if driver_series is None else pnl_by_factor.index.intersection(driver_series.index)
+
+if len(common_idx) == 0:
+    st.info("Aucune date commune entre PnL par facteur et driver.")
+else:
+    default_date = common_idx.max()
+    date_pick = st.date_input(
+        "Date à inspecter",
+        value=default_date.date(),
+        min_value=common_idx.min().date(),
+        max_value=common_idx.max().date(),
+        key="tab2_risk_delta_date",
+    )
+    date_pick = pd.to_datetime(date_pick)
+
+    if date_pick not in common_idx:
+        st.warning("Date hors plage des données.")
+    else:
+        pnl_row = pnl_by_factor.loc[date_pick].copy()
+        total_pnl_today = float(pnl_row.sum())
+        driver_val = np.nan if (driver_series is None or pd.isna(driver_series.loc[date_pick])) else float(driver_series.loc[date_pick])
+
+        # Risk Δ par constituant: PnL = RiskΔ * Driver  => RiskΔ = PnL / Driver
+        if not np.isfinite(driver_val) or abs(driver_val) < 1e-12:
+            st.warning("Driver nul ou non défini ce jour — division impossible. On affiche uniquement les PnL.")
+            risk_delta = pd.Series(np.nan, index=pnl_row.index)
+        else:
+            risk_delta = pnl_row / driver_val
+
+        # Rang par |PnL_jour|
+        rank_abs = pnl_row.abs().rank(ascending=False, method="min").astype(int)
+
+        detail_df = pd.DataFrame({
+            "PnL_jour": pnl_row,
+            "RiskDelta": risk_delta,
+            "Rang_absPnL": rank_abs,
+        })
+        detail_df["Driver(dtype)"] = driver_val
+        detail_df["Check RiskΔ×Driver − PnL"] = detail_df["RiskDelta"] * driver_val - detail_df["PnL_jour"]
+        detail_df = detail_df.sort_values("PnL_jour", ascending=False)
+
+        st.markdown(
+            f"**Driver** = Δ{dtype} = `{driver_val:,.6f}` — **PnL total jour** = `{total_pnl_today:,.0f}`"
+            if np.isfinite(driver_val) else f"**PnL total jour** = `{total_pnl_today:,.0f}` (driver indisponible)"
+        )
+
+        st.dataframe(
+            detail_df.style.format({
+                "PnL_jour": "{:,.0f}",
+                "RiskDelta": "{:,.6f}",
+                "Driver(dtype)": "{:,.6f}",
+                "Check RiskΔ×Driver − PnL": "{:,.6f}",
+            }).applymap(lambda v: "color:red;" if isinstance(v,(int,float)) and v<0 else "", subset=["PnL_jour"]),
+            use_container_width=True,
+            height=420,
+        )
+
+        st.download_button(
+            "Télécharger détail (CSV)",
+            data=detail_df.to_csv().encode("utf-8"),
+            file_name=f"{dtype}_detail_risk_delta_{date_pick.date()}.csv",
+            mime="text/csv",
+        )
+
+        # Mini-barplot PnL du jour (Top-N par |PnL|)
+        topN = st.slider("Top-N pour le barplot (par |PnL|)", 5, min(30, len(pnl_row)), min(10, len(pnl_row)), 1)
+        top_idx = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index
+        pnl_top = pnl_row.reindex(top_idx)
+
+        fig_bar, ax_bar = plt.subplots(figsize=(10, 6), dpi=120)
+        ax_bar.barh(pnl_top.index[::-1], pnl_top.values[::-1], alpha=0.9)
+        ax_bar.set_title(f"PnL du jour — Top {int(topN)} constituants ({date_pick.date()})")
+        ax_bar.set_xlabel("PnL du jour")
+        ax_bar.yaxis.set_tick_params(labelsize=9)
+        ax_bar.xaxis.set_major_formatter(FuncFormatter(lambda v, pos: f"{v:,.0f}"))
+        st.pyplot(fig_bar)
