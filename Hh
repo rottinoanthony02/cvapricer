@@ -1,0 +1,105 @@
+# ---------------------------------------------------------
+# TAB 3 — KNN Régimes + DV01/FX01 + Coûts
+# ---------------------------------------------------------
+with tab3:
+    st.header("KNN — Régimes de marché & DV01/FX01 (Coeff/Bump)")
+
+    # --- Params ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_neighbors_knn = st.slider("KNN — n_neighbors", 2, 15, 5)
+    with c2:
+        top_n = st.slider("Top N constituants par date", 1, 20, 4)
+    with c3:
+        alpha_cov = st.slider("α — % à couvrir", 0, 100, 100, 5)/100.0
+
+    coeff_cols = [c for c in coeff_df.columns if c != "DataType"]
+    scen_coeff = st.selectbox("Scénario (Coeff)", coeff_cols, index=0)
+
+    coeff_s = coeff_df.set_index("DataType")[scen_coeff].astype(float).reindex(risk_cols)
+    bump_s = mapping_df.reindex(risk_cols)["Bump"].astype(float).fillna(1.0)
+    dv01_per_unit = (coeff_s / bump_s).replace([np.inf, -np.inf], np.nan)
+
+    # --- KNN ---
+    X = pnl_by_factor.fillna(0.0)
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+    y = np.where(net_daily >= 0, 1, -1)
+    knn = KNeighborsClassifier(n_neighbors=n_neighbors_knn)
+    knn.fit(Xz, y)
+    y_hat = knn.predict(Xz)
+    labels_knn = pd.Series(y_hat, index=X.index)
+    entries = [d for i, d in enumerate(labels_knn.index[1:]) if labels_knn.iloc[i+1] < 0 < labels_knn.iloc[i]]
+
+    # --- Graph ---
+    figR, axR = plt.subplots(figsize=(12,5))
+    axR.plot(net_daily.index, net_daily.values, lw=1.1, label="PnL quotidien")
+    axR.fill_between(net_daily.index, net_daily.values, 0, where=(labels_knn.values < 0), color="red", alpha=0.18)
+    for d in entries:
+        axR.axvline(d, color="red", linestyle=":")
+    axR.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
+    axR.set_title("KNN — PnL & régimes (zones rouges = négatifs)")
+    st.pyplot(figR)
+
+    # --- Table Top N par entrée ---
+    rows = []
+    for d in entries:
+        if d not in pnl_by_factor.index or d not in mkt_change.index: continue
+        pnl_row = pnl_by_factor.loc[d]; dS_row = mkt_change.loc[d]
+        topN = pnl_row.abs().sort_values(ascending=False).head(top_n).index
+        for c in topN:
+            pnl_c = pnl_row[c]; dS_c = dS_row[c]
+            bump_c = bump_s.get(c, np.nan); coeff_c = coeff_s.get(c, np.nan)
+            dv01_unit = dv01_per_unit.get(c, np.nan)
+            dv01_full = pnl_c / bump_c if bump_c else np.nan
+            dv01_alpha = dv01_full * alpha_cov
+            rows.append({
+                "Date": d, "Constituant": c, "PnL": pnl_c, "ΔS": dS_c,
+                "Bump": bump_c, "Coeff": coeff_c,
+                "DV01/FX01 (unit)": dv01_unit,
+                "Hedge100%": dv01_full,
+                "Hedge(α×)": dv01_alpha
+            })
+    tbl = pd.DataFrame(rows)
+
+    if not tbl.empty:
+        st.dataframe(tbl.style.format("{:,.4f}").applymap(lambda v: "color:red;" if isinstance(v,(int,float)) and v<0 else ""))
+        st.download_button("Télécharger CSV", tbl.to_csv(index=False).encode("utf-8"), "knn_entries.csv", "text/csv")
+
+    # --- Coûts & PnL net ---
+    st.subheader("Coût de hedge et PnL net")
+    c1, c2, c3 = st.columns(3)
+    cost_rate = c1.number_input("Coût Rates", 0.0, 5.0, 0.20)
+    cost_xccy = c2.number_input("Coût XCCY", 0.0, 5.0, 0.25)
+    cost_fx   = c3.number_input("Coût FX", 0.0, 5.0, 0.00)
+
+    def bucket(n):
+        n = str(n).upper()
+        if "FX" in n or n in FX_COLS: return "FX"
+        if "XCCY" in n or "BASIS" in n: return "XCCY"
+        return "Rates"
+
+    cost_series = pd.Series(0.0, index=net_daily.index)
+    for d, sub in tbl.groupby("Date"):
+        tot = 0.0
+        for _, r in sub.iterrows():
+            b = bucket(r["Constituant"])
+            val = abs(r["Hedge(α×)"])
+            if b == "FX": tot += val * cost_fx
+            elif b == "XCCY": tot += val * cost_xccy
+            else: tot += val * cost_rate
+        cost_series.loc[d] = tot
+
+    contrib_after = pnl_by_factor.copy()
+    for d, sub in tbl.groupby("Date"):
+        cols = sub["Constituant"].unique()
+        contrib_after.loc[d, cols] *= (1 - alpha_cov)
+
+    pnl_base = pnl_by_factor.sum(axis=1)
+    pnl_hedged = contrib_after.sum(axis=1) - cost_series
+
+    fig_net, ax_net = plt.subplots(figsize=(12,5))
+    ax_net.plot(pnl_base.cumsum(), label="Baseline")
+    ax_net.plot(pnl_hedged.cumsum(), label="Hedged (net coût)")
+    ax_net.legend()
+    ax_net.set_title("Cumulative PnL — Baseline vs Hedged (net coût)")
