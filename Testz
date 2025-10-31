@@ -1,0 +1,237 @@
+# =========================
+# TAB 3 — Régimes KNN (simple) + Table des entrées & DV01/FX01 (Coeff/Bump)
+# =========================
+try:
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.preprocessing import StandardScaler
+    from matplotlib.ticker import FuncFormatter
+
+    st.header("Régimes KNN (simple) + DV01/FX01 par constituant")
+
+    # ---- Hyperparams & inputs ----
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_neighbors_knn = st.slider("KNN — n_neighbors", 2, 15, 5, 1, key="knn_simple_n")
+    with c2:
+        top_n = st.slider("Top N constituants par date", 1, 20, 4, 1, key="knn_simple_topn")
+    with c3:
+        alpha_cov = st.slider("α — % à couvrir", 0, 100, 100, 5, key="knn_simple_alpha")/100.0
+
+    # Scenario column from Coeff for per‑unit DV01/FX01
+    coeff_cols = [c for c in coeff_df.columns if str(c) != "DataType"]
+    scen_coeff = scenario if ('scenario' in globals() and scenario in coeff_cols) else st.selectbox(
+        "Scénario (Coeff)", coeff_cols, index=0, key="knn_simple_scen")
+
+    # ---- Build per‑unit DV01/FX01 from Coeff/Bump (diagonal) ----
+    coeff_s = (
+        coeff_df.set_index("DataType")[scen_coeff]
+        .astype(float)
+        .reindex(risk_cols)
+    )
+    bump_s = (
+        mapping_df.reindex(risk_cols)["Bump"]
+        .astype(float)
+        .where(lambda s: s.notna() & (s != 0.0))
+    )
+    dv01_per_unit = (coeff_s / bump_s).replace([np.inf, -np.inf], np.nan)
+
+    # ---- KNN on contributions (labels = sign of net PnL) ----
+    X = pnl_by_factor.fillna(0.0)
+    scaler = StandardScaler()
+    Xz = scaler.fit_transform(X)
+    y = np.where(net_daily.reindex(X.index).fillna(0.0).values >= 0.0, 1, -1)
+
+    knn = KNeighborsClassifier(n_neighbors=int(n_neighbors_knn))
+    knn.fit(Xz, y)
+    y_hat = knn.predict(Xz)
+    labels_knn = pd.Series(y_hat, index=X.index, name="Regime")
+
+    # ---- Regime change dates: entries into negative regime ----
+    entries = []
+    prev = None
+    for dt, lab in labels_knn.items():
+        if prev is None:
+            prev = lab; continue
+        if (lab < 0) and (lab != prev):
+            entries.append(dt)
+        prev = lab
+
+    # ---- Plot regimes ----
+    figR, axR = plt.subplots(figsize=(12,5), dpi=120)
+    axR.plot(net_daily.index, net_daily.values, lw=1.1, label='PnL quotidien')
+    axR.fill_between(net_daily.index, net_daily.values, 0, where=(labels_knn.values < 0),
+                     color='red', alpha=0.18, label='Régime négatif')
+    if len(entries):
+        axR.vlines(entries, ymin=min(float(net_daily.min()),0.0), ymax=max(float(net_daily.max()),0.0),
+                    linestyles=':', color='red', alpha=0.5, label='Entrée régime négatif')
+    axR.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
+    # x adaptive ticks
+    npts=len(net_daily)
+    if npts<120:
+        locx=mdates.MonthLocator(interval=1); fmtx=mdates.DateFormatter('%b %Y')
+    elif npts<300:
+        locx=mdates.MonthLocator(interval=3); fmtx=mdates.DateFormatter('%b %Y')
+    elif npts<700:
+        locx=mdates.MonthLocator(interval=6); fmtx=mdates.DateFormatter('%b %Y')
+    else:
+        locx=mdates.YearLocator(); fmtx=mdates.DateFormatter('%Y')
+    axR.xaxis.set_major_locator(locx); axR.xaxis.set_major_formatter(fmtx)
+    axR.set_title('KNN — PnL & régimes (simple)')
+    axR.legend(loc='upper left')
+    st.pyplot(figR)
+
+    # ---- Build table per entry date with Top N constituents ----
+    rows = []
+    for d in entries:
+        if d not in pnl_by_factor.index or d not in mkt_change.index:
+            continue
+        pnl_row = pnl_by_factor.loc[d].reindex(risk_cols)
+        dS_row  = mkt_change.loc[d].reindex(risk_cols)
+        # pick top N by |PnL|
+        topN = pnl_row.abs().sort_values(ascending=False).head(int(top_n)).index.tolist()
+        for c in topN:
+            pnl_c = float(pnl_row.get(c, np.nan))
+            dS_i  = float(dS_row.get(c, np.nan))
+            bump_c = float(bump_s.get(c, np.nan))
+            coeff_c = float(coeff_s.get(c, np.nan))
+            dv01_unit_c = float(dv01_per_unit.get(c, np.nan))
+            # Hedge to neutralize PnL of the constituent at 100% under the scenario bump
+            dv01_needed = (pnl_c / bump_c) if (np.isfinite(bump_c) and abs(bump_c)>1e-12) else np.nan
+            dv01_alpha  = dv01_needed * float(alpha_cov) if np.isfinite(dv01_needed) else np.nan
+            # Delta created (units) = +PnL/Bump (signed), hedge is −that
+            delta_created = dv01_needed
+            rows.append({
+                "Date": d,
+                "Constituant": c,
+                "PnL_contrib": pnl_c,
+                "MarketMove ΔS_i": dS_i,
+                "Bump (Mapping)": bump_c,
+                "Coeff(ΔPnL)": coeff_c,
+                "DV01/FX01 per‑unit (Coeff/Bump)": dv01_unit_c,
+                "Delta_created (units)": delta_created,
+                "DV01/FX01 to hedge 100%": dv01_needed,
+                "DV01/FX01 (α×)": dv01_alpha,
+            })
+
+    tbl_entries = pd.DataFrame(rows).sort_values(["Date","Constituant"]) if len(rows) else pd.DataFrame()
+
+    # ---- Display tables ----
+    st.subheader("Dates d'entrée en régime négatif")
+    if len(entries)==0:
+        st.info("Aucune entrée détectée.")
+    else:
+        st.write(", ".join(pd.to_datetime(entries).strftime("%Y-%m-%d")))
+
+    st.subheader("Top N constituants par date — PnL, moves & DV01/FX01 (Coeff/Bump)")
+    if tbl_entries.empty:
+        st.info("Table vide (vérifier données et Mapping.Bump/Coeff).")
+    else:
+        st.dataframe(
+            tbl_entries.style.format({
+                "PnL_contrib":"{:,.0f}",
+                "MarketMove ΔS_i":"{:,.6f}",
+                "Bump (Mapping)":"{:,.6f}",
+                "Coeff(ΔPnL)":"{:,.0f}",
+                "DV01/FX01 per‑unit (Coeff/Bump)":"{:,.0f}",
+                "Delta_created (units)":"{:,.0f}",
+                "DV01/FX01 to hedge 100%":"{:,.0f}",
+                "DV01/FX01 (α×)":"{:,.0f}",
+            }).applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else '', subset=[
+                'PnL_contrib','Delta_created (units)','DV01/FX01 to hedge 100%','DV01/FX01 (α×)'
+            ]),
+            use_container_width=True
+        )
+        st.download_button(
+            "Télécharger (CSV) — Entrées & DV01/FX01",
+            data=tbl_entries.to_csv(index=False).encode('utf-8'),
+            file_name=f"knn_entries_dv01_{scen_coeff}.csv",
+            mime="text/csv",
+        )
+except Exception as _e_knn_simple:
+    st.warning(f"Tab 3 (KNN simple) non rendue: {_e_knn_simple}")
+# =========================
+# Tab 3 — Coût de hedge & PnL Hedged vs Baseline (compact)
+# =========================
+try:
+    st.subheader("Coût de hedge et PnL net (KNN simple)")
+    if 'tbl_entries' in globals() and isinstance(tbl_entries, pd.DataFrame) and not tbl_entries.empty:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cost_rate = st.number_input("Coût — Rates (par DV01)", 0.0, 5.0, 0.20, 0.01, key="cost_rate_knn_simple")
+        with c2:
+            cost_xccy = st.number_input("Coût — XCCY (par DV01)", 0.0, 5.0, 0.25, 0.01, key="cost_xccy_knn_simple")
+        with c3:
+            cost_fx   = st.number_input("Coût — FX (par FX01)",   0.0, 5.0, 0.00, 0.01, key="cost_fx_knn_simple")
+
+        def _bucket(name: str) -> str:
+            n = str(name).upper()
+            if 'FX' in n or (('FX_COLS' in globals()) and (name in FX_COLS)):
+                return 'FX'
+            if 'XCCY' in n or 'BASIS' in n:
+                return 'XCCY'
+            return 'Rates'
+
+        # Série de coûts: somme(|DV01/FX01 (α×)| * coût par bucket) le jour d'entrée
+        cost_series = pd.Series(0.0, index=net_daily.index)
+        for d, sub in tbl_entries.groupby('Date'):
+            tot = 0.0
+            for _, r in sub.iterrows():
+                units = r.get('DV01/FX01 (α×)', np.nan)
+                if not np.isfinite(units) or units == 0:
+                    continue
+                b = _bucket(r.get('Constituant',''))
+                if b == 'FX':
+                    tot += abs(units) * float(cost_fx)
+                elif b == 'XCCY':
+                    tot += abs(units) * float(cost_xccy)
+                else:
+                    tot += abs(units) * float(cost_rate)
+            if d in cost_series.index:
+                cost_series.loc[d] += tot
+
+        # Appliquer la réduction α sur les constituants sélectionnés le jour d'entrée (pas d'effet durée)
+        contrib_after = pnl_by_factor.copy()
+        for d, sub in tbl_entries.groupby('Date'):
+            if d not in contrib_after.index:
+                continue
+            comps = sub['Constituant'].unique().tolist()
+            contrib_after.loc[d, comps] = contrib_after.loc[d, comps] * (1.0 - float(alpha_cov))
+
+        pnl_base = pnl_by_factor.sum(axis=1).rename('PnL_baseline')
+        pnl_hedged = (contrib_after.sum(axis=1) - cost_series).rename('PnL_hedged_net')
+        cum_base = pnl_base.cumsum(); cum_hedged = pnl_hedged.cumsum()
+
+        fig_net, ax_net = plt.subplots(figsize=(12,5), dpi=120)
+        ax_net.plot(cum_base.index, cum_base.values, label='Baseline')
+        ax_net.plot(cum_hedged.index, cum_hedged.values, label='Hedged (net coût)')
+        if 'entries' in globals() and len(entries)>0:
+            ax_net.vlines([d for d in entries], ymin=min(float(cum_base.min()), float(cum_hedged.min())),
+                          ymax=max(float(cum_base.max()), float(cum_hedged.max())), linestyles=':', color='red', alpha=0.35,
+                          label='Entrées négatives')
+        ax_net.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
+        # Axe X adaptatif
+        npts=len(cum_base)
+        if npts<120:
+            locx=mdates.MonthLocator(interval=1); fmtx=mdates.DateFormatter('%b %Y')
+        elif npts<300:
+            locx=mdates.MonthLocator(interval=3); fmtx=mdates.DateFormatter('%b %Y')
+        elif npts<700:
+            locx=mdates.MonthLocator(interval=6); fmtx=mdates.DateFormatter('%b %Y')
+        else:
+            locx=mdates.YearLocator(); fmtx=mdates.DateFormatter('%Y')
+        ax_net.xaxis.set_major_locator(locx); ax_net.xaxis.set_major_formatter(fmtx)
+        ax_net.set_title('Cumulative PnL — Baseline vs Hedged (net coût)')
+        ax_net.legend(loc='upper left')
+        st.pyplot(fig_net)
+
+        # KPIs
+        tot_cost = float(cost_series.sum())
+        pnl_diff = float(cum_hedged.iloc[-1] - cum_base.iloc[-1])
+        k1, k2 = st.columns(2)
+        with k1: st.metric("Coût total hedge", f"{tot_cost:,.0f}")
+        with k2: st.metric("Δ PnL cumulé (Hedged - Baseline)", f"{pnl_diff:,.0f}")
+    else:
+        st.info("La table d'entrées est vide — aucun coût/graphique à afficher.")
+except Exception as _e_knn_cost_simple:
+    st.warning(f"Coût & PnL net (Tab 3) non rendus: {_e_knn_cost_simple}")
+
