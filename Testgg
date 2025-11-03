@@ -1,0 +1,658 @@
+# =========================
+# TAB 3 — Regimes HMM (GaussianHMM) + Table des entrées & DV01/FX01 (Coeff_total incluant DataType)
+# =========================
+try:
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from matplotlib.ticker import FuncFormatter
+
+    st.header("Régimes (HMM — Gaussian) + DV01/FX01 par constituant (Coeff_total incluant DataType)")
+
+    # ---- Hyperparams & inputs ----
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        hmm_states = st.slider("Nombre de régimes (HMM)", 2, 6, 3, 1, key="hmm_tab3_states")
+    with c2:
+        n_iter = st.number_input("n_iter (EM itérations)", 50, 2000, 300, 50, key="hmm_tab3_niter")
+    with c3:
+        top_n = st.slider("Top N constituants par date", 1, 20, 4, 1, key="hmm_tab3_topn")
+    with c4:
+        alpha_cov = st.slider("α — % à couvrir", 0, 100, 100, 5, key="hmm_tab3_alpha")/100.0
+
+    # ---- Coeff_total (somme de tous les scénarios + DataType inclus) ----
+    coeff_cols = [c for c in coeff_df.columns if str(c) != "DataType"]
+    coeff_total = (
+        coeff_df.set_index("DataType")[coeff_cols]
+        .astype(float)
+        .sum(axis=1)
+        .add(coeff_df.set_index("DataType").index.to_series().apply(lambda x: 0.0 if pd.isna(x) else 0.0))  # placeholder
+        .reindex(risk_cols)
+    )
+    bump_s = (
+        mapping_df.reindex(risk_cols)["Bump"]
+        .astype(float)
+        .where(lambda s: s.notna() & (s != 0.0))
+    )
+    dv01_per_unit = (coeff_total / bump_s).replace([np.inf, -np.inf], np.nan)
+
+    # ---- HMM sur le PnL net quotidien (observation 1D) ----
+    pnl_obs = net_daily.dropna()
+    X_obs = pnl_obs.values.reshape(-1, 1)
+    idx_obs = pnl_obs.index
+
+    hmm = GaussianHMM(n_components=int(hmm_states), covariance_type='full', n_iter=int(n_iter), random_state=42)
+    hmm.fit(X_obs)
+    states = pd.Series(hmm.predict(X_obs), index=idx_obs, name="state")
+    post = pd.DataFrame(hmm.predict_proba(X_obs), index=idx_obs, columns=[f"Regime {i}" for i in range(int(hmm_states))])
+
+    # ---- Transitions de régime (neutres) ----
+    entries = []
+    prev = None
+    for dt, lab in states.items():
+        if prev is None:
+            prev = lab
+            continue
+        if lab != prev:
+            entries.append(dt)
+        prev = lab
+
+    # ---- Graphique des régimes (tous états colorés) ----
+    figR, axR = plt.subplots(figsize=(12,5), dpi=120)
+    axR.plot(net_daily.index, net_daily.values, lw=1.1, label='PnL quotidien')
+    cmap = plt.cm.get_cmap('tab10', int(hmm_states))
+    for s_id in range(int(hmm_states)):
+        mask = states == s_id
+        axR.fill_between(net_daily.index, net_daily.values, 0,
+                         where=mask.reindex(net_daily.index).fillna(False),
+                         color=cmap(s_id), alpha=0.18, label=f'Regime {s_id}')
+    if len(entries):
+        axR.vlines(entries, ymin=min(float(net_daily.min()),0.0), ymax=max(float(net_daily.max()),0.0),
+                    linestyles=':', color='black', alpha=0.4, label='Changement de régime')
+    axR.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
+    axR.set_title('HMM — Régimes de marché (coloration neutre par état)')
+    axR.legend(loc='upper left', ncols=2)
+    st.pyplot(figR)
+
+    st.subheader("Statistiques HMM par état")
+    net_on_state = pd.concat([net_daily, states], axis=1).dropna()
+    hmm_stats = (
+        net_on_state.groupby('state')['NetDailyPnL']
+        .agg(['size','mean','std'])
+        .rename(columns={'size':'n_days','mean':'mean_pnl','std':'std_pnl'})
+        .sort_index()
+    )
+    try:
+        st.dataframe(
+            hmm_stats.style.format({'n_days': '{:.0f}', 'mean_pnl': '{:,.0f}', 'std_pnl': '{:,.0f}'}),
+            use_container_width=True
+        )
+    except Exception:
+        st.dataframe(hmm_stats, use_container_width=True)
+
+    # ---- Table Top-N par date de transition ----
+    rows = []
+    for d in entries:
+        if d not in pnl_by_factor.index:
+            continue
+        pnl_row = pnl_by_factor.loc[d].reindex(risk_cols)
+        dS_row  = mkt_change.loc[d].reindex(risk_cols) if d in mkt_change.index else pd.Series(index=risk_cols, dtype=float)
+        topN = pnl_row.abs().sort_values(ascending=False).head(int(top_n)).index.tolist()
+        for c in topN:
+            pnl_c = float(pnl_row.get(c, np.nan))
+            dS_i  = float(dS_row.get(c, np.nan))
+            bump_c = float(bump_s.get(c, np.nan))
+            coeff_tot_c = float(coeff_total.get(c, np.nan))
+            dv01_unit_c = float(dv01_per_unit.get(c, np.nan))
+            if np.isfinite(dS_i) and abs(dS_i) > 1e-12:
+                hedge_100 = -(pnl_c / dS_i)
+                logic = "−PnL/ΔS"
+            elif np.isfinite(bump_c) and abs(bump_c) > 1e-12:
+                hedge_100 = -(pnl_c / bump_c)
+                logic = "−PnL/Bump (fallback)"
+            else:
+                hedge_100 = np.nan
+                logic = "n/a"
+            hedge_alpha = hedge_100 * float(alpha_cov) if np.isfinite(hedge_100) else np.nan
+            rows.append({
+                "Date": d,
+                "Constituant": c,
+                "PnL_contrib": pnl_c,
+                "MarketMove ΔS_i": dS_i,
+                "Bump (Mapping)": bump_c,
+                "Coeff_total (∑ scénarios + DataType)": coeff_tot_c,
+                "DV01/FX01 per-unit (Coeff_total/Bump)": dv01_unit_c,
+                "Hedge100% (−PnL/ΔS)": hedge_100,
+                "Hedge(α×)": hedge_alpha,
+                "Logic": logic,
+            })
+
+    tbl_entries = pd.DataFrame(rows)
+    if not tbl_entries.empty:
+        tbl_entries["AbsPnL"] = tbl_entries["PnL_contrib"].abs()
+        tbl_entries = tbl_entries.sort_values(["Date","AbsPnL"], ascending=[True, False]).drop(columns=["AbsPnL"])
+
+    st.subheader("Top N constituants par date — PnL, moves & DV01/FX01 (HMM)")
+    if tbl_entries.empty:
+        st.info("Table vide.")
+    else:
+        st.dataframe(
+            tbl_entries.style.format({
+                "PnL_contrib":"{:,.0f}",
+                "MarketMove ΔS_i":"{:,.6f}",
+                "Bump (Mapping)":"{:,.6f}",
+                "Coeff_total (∑ scénarios + DataType)":"{:,.0f}",
+                "DV01/FX01 per-unit (Coeff_total/Bump)":"{:,.0f}",
+                "Hedge100% (−PnL/ΔS)":"{:,.0f}",
+                "Hedge(α×)":"{:,.0f}",
+            }).applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else '', subset=['PnL_contrib','Hedge100% (−PnL/ΔS)','Hedge(α×)']),
+            use_container_width=True
+        )
+        st.download_button(
+            "Télécharger (CSV) — Entrées & DV01/FX01 (HMM)",
+            data=tbl_entries.to_csv(index=False).encode('utf-8'),
+            file_name=f"hmm_entries_dv01_{dtype}.csv",
+            mime="text/csv",
+        )
+except Exception as _e_hmm_tab3:
+    st.warning(f"Tab 3 (HMM) non rendue: {_e_hmm_tab3}")
+
+# =========================
+# Tab 3 — Coût de hedge & PnL Hedged vs Baseline (semi-supervisé, α = f(probabilité))
+# =========================
+try:
+    st.subheader("Coût de hedge et PnL net — α proportionnel à une probabilité (HMM ou LightGBM)")
+
+    if 'pnl_by_factor' in globals() and isinstance(pnl_by_factor, pd.DataFrame) and not pnl_by_factor.empty:
+        # --- Sélection de la source de probabilité ---
+        # Source unique: LightGBM (proba transition)
+st.markdown("**Source de probabilité pour α : LightGBM (fixe)**")
+src = "LightGBM (proba transition)"",
+            "HMM (per-constituant, moy. pondérée)",
+            "HMM (multivarié)",
+            "LightGBM (proba transition)",
+            "Manuel (α fixe)"
+        ], index=0, horizontal=False, key="alpha_source")
+
+        # Paramètres coût
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            cost_rate = st.number_input("Coût — Rates (par DV01)", 0.0, 5.0, 0.20, 0.01, key="cost_rate_knn_prob")
+        with c2:
+            cost_xccy = st.number_input("Coût — XCCY (par DV01)", 0.0, 5.0, 0.25, 0.01, key="cost_xccy_knn_prob")
+        with c3:
+            cost_fx   = st.number_input("Coût — FX (par FX01)",   0.0, 5.0, 0.00, 0.01, key="cost_fx_knn_prob")
+
+        # Mapping α = f(p)
+        st.markdown("**Mapping α = f(p)** (seuillage piecewise)")
+        d1, d2, d3 = st.columns(3)
+        with d1:
+            tau1 = st.slider("τ1 (→ α=0.3)", 0.0, 1.0, 0.50, 0.05, key="tau1_alpha")
+        with d2:
+            tau2 = st.slider("τ2 (→ α=0.6)", 0.0, 1.0, 0.70, 0.05, key="tau2_alpha")
+        with d3:
+            tau3 = st.slider("τ3 (→ α=1.0)", 0.0, 1.0, 0.85, 0.05, key="tau3_alpha")
+
+        def alpha_from_p(p: float) -> float:
+            if not np.isfinite(p):
+                return 0.0
+            if p < tau1: return 0.0
+            if p < tau2: return 0.3
+            if p < tau3: return 0.6
+            return 1.0
+
+        # Probabilité par date — LightGBM uniquement
+        if 'proba_all' in globals() and isinstance(proba_all, pd.Series) and not proba_all.empty:
+            proba_series = proba_all.reindex(pnl_by_factor.index).fillna(method='ffill')
+            st.info("α piloté par **LightGBM** : probabilité de transition imminente.")
+        else:
+            st.error("Probabilités LightGBM indisponibles. Va dans Tab 4 pour entraîner le modèle.")
+            proba_series = pd.Series(0.0, index=pnl_by_factor.index)
+
+        # Buckets pour coûts
+        def _bucket(name: str) -> str:
+            n = str(name).upper()
+            if 'FX' in n or (('FX_COLS' in globals()) and (name in FX_COLS)):
+                return 'FX'
+            if 'XCCY' in n or 'BASIS' in n:
+                return 'XCCY'
+            return 'Rates'
+
+        # Vecteurs indispensables
+        risk_cols_loc = [c for c in pnl_by_factor.columns]
+        bump_s_loc = mapping_df.reindex(risk_cols_loc)["Bump"].astype(float).where(lambda s: s.notna() & (s != 0.0))
+
+        # --- 1) Construire contrib_after via α(p_t) appliqué quotidiennement sur Top-N par |PnL| ---
+        topN = st.slider("Top N constituants par jour à couvrir", 1, 20, 4, 1, key="topN_prob_alpha")
+        contrib_after = pnl_by_factor.copy()
+        cost_by_const = pd.Series(0.0, index=risk_cols_loc, dtype=float)
+
+        for d in pnl_by_factor.index:
+            pnl_row = pnl_by_factor.loc[d].reindex(risk_cols_loc)
+            alpha_t = float(alpha_from_p(float(proba_series.get(d, 0.0))))
+            if alpha_t <= 0:
+                continue
+            top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+            # Applique la réduction α sur ces colonnes ce jour-là
+            contrib_after.loc[d, top_names] = contrib_after.loc[d, top_names] * (1.0 - alpha_t)
+            # Coût: somme |units_alpha| * coût(bucket), avec units_alpha = α * (PnL_c / Bump_c)
+            for cst in top_names:
+                pnl_c = float(pnl_row.get(cst, 0.0))
+                bump_c = float(bump_s_loc.get(cst, np.nan))
+                if not np.isfinite(bump_c) or abs(bump_c) < 1e-12:
+                    continue
+                units_alpha = (alpha_t * (pnl_c / bump_c))
+                b = _bucket(cst)
+                unit_cost = cost_fx if b == 'FX' else (cost_xccy if b == 'XCCY' else cost_rate)
+                cost_by_const.loc[cst] = cost_by_const.get(cst, 0.0) + abs(units_alpha) * float(unit_cost)
+
+        # --- 2) Agrégation COLONNE : totaux par constituant ---
+        base_totals   = pnl_by_factor.sum(axis=0).rename("BaseTotal")
+        hedged_totals = contrib_after.sum(axis=0).rename("HedgedTotal_gross")
+        cost_by_const = cost_by_const.rename("HedgeCost_alloc")
+        hedged_net    = (hedged_totals - cost_by_const).rename("HedgedTotal_net")
+        delta_total   = (hedged_net - base_totals).rename("Delta(HedgedNet-Base)")
+
+        view_cols = pd.concat([base_totals, hedged_totals, cost_by_const, hedged_net, delta_total], axis=1).fillna(0.0)
+        view_cols = view_cols.reindex(view_cols["Delta(HedgedNet-Base)"].abs().sort_values(ascending=False).index)
+
+        st.dataframe(
+            view_cols.style.format({
+                "BaseTotal": "{:,.0f}",
+                "HedgedTotal_gross": "{:,.0f}",
+                "HedgeCost_alloc": "{:,.0f}",
+                "HedgedTotal_net": "{:,.0f}",
+                "Delta(HedgedNet-Base)": "{:,.0f}",
+            }).applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else ''),
+            use_container_width=True, height=420
+        )
+
+        # KPIs globaux (somme des colonnes)
+        tot_base  = float(base_totals.sum())
+        tot_hedge = float(hedged_net.sum())
+        tot_cost  = float(cost_by_const.sum())
+        k1, k2, k3 = st.columns(3)
+        with k1: st.metric("Total Base (∑ colonnes)", f"{tot_base:,.0f}")
+        with k2: st.metric("Total Hedged net (∑ colonnes)", f"{tot_hedge:,.0f}")
+        with k3: st.metric("Coût total hedge (∑ colonnes)", f"{tot_cost:,.0f}")
+
+        # Export
+        st.download_button(
+            "Télécharger (CSV) — Totaux par constituant (α = f(p))",
+            data=view_cols.to_csv().encode("utf-8"),
+            file_name="pnl_totaux_par_constituant_alpha_prob.csv",
+            mime="text/csv"
+        )
+    else:
+        st.info("Séries PnL indisponibles — impossible de calculer le hedge.")
+except Exception as _e_knn_cost_total:
+    st.warning(f"Coût & PnL net (α=f(p)) non rendus: {_e_knn_cost_total}")
+
+# =========================
+# TAB 4 — Détection de transition (supervisé) : proba de changement de régime
+# =========================
+try:
+    st.header("Détection de transition — Probabilité de changement de régime (ML)")
+
+    # --- Hyperparams & choix modèle ---
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        horizon_next = st.slider("Horizon détection (jours)", 1, 10, 3, 1, key="trans_horizon")
+    with c2:
+        n_lags = st.slider("Nb de lags ΔS", 1, 10, 3, 1, key="trans_nlags")
+    with c3:
+        test_size_pct = st.slider("Test size % (chronologique)", 10, 50, 20, 5, key="trans_testpct") / 100.0
+    with c4:
+        alert_thr = st.slider("Seuil alerte proba", 10, 90, 70, 5, key="trans_thr") / 100.0
+
+    # --- Assurer des labels de régime depuis Tab 3 (sinon recalcul rapide) ---
+    if 'labels_knn' not in globals() or not isinstance(labels_knn, pd.Series) or labels_knn.empty:
+        from sklearn.cluster import KMeans
+        from sklearn.preprocessing import StandardScaler
+        X_tmp = pnl_by_factor.fillna(0.0)
+        scaler_tmp = StandardScaler()
+        Xz_tmp = scaler_tmp.fit_transform(X_tmp)
+        n_clusters_tmp = 3
+        kmeans_tmp = KMeans(n_clusters=n_clusters_tmp, n_init=10, random_state=42)
+        labels_knn = pd.Series(kmeans_tmp.fit_predict(Xz_tmp), index=X_tmp.index, name="cluster")
+
+    # --- Déterminer les transitions (toutes transitions entre clusters) ---
+    trans_dates = []
+    prev_lab = None
+    for dt, lab in labels_knn.items():
+        if prev_lab is None:
+            prev_lab = lab
+            continue
+        if lab != prev_lab:
+            trans_dates.append(dt)
+        prev_lab = lab
+
+    # --- Construire labels supervisés : 1 si transition dans les 'horizon_next' jours ---
+    all_idx = mkt_change.index.intersection(labels_knn.index)
+    y = pd.Series(0, index=all_idx, dtype=int)
+    trans_set = set(pd.to_datetime(trans_dates))
+    for t in all_idx:
+        # si une transition survient dans [t+1, t+horizon_next]
+        future_window = [t + pd.Timedelta(days=h) for h in range(1, int(horizon_next)+1)]
+        if any(f in trans_set for f in future_window):
+            y.loc[t] = 1
+
+    # --- Features : lags de ΔS (mkt_change)
+    X_feat_list = []
+    for lag in range(0, int(n_lags)):
+        if lag == 0:
+            X_feat_list.append(mkt_change.reindex(all_idx).add_suffix(f"_lag0"))
+        else:
+            X_feat_list.append(mkt_change.shift(lag).reindex(all_idx).add_suffix(f"_lag{lag}"))
+    X_feat = pd.concat(X_feat_list, axis=1).dropna()
+
+    # Aligner X et y, enlever NaNs éventuels
+    y = y.reindex(X_feat.index).fillna(0).astype(int)
+
+    # --- Split chronologique ---
+    n_total = len(X_feat)
+    n_test = max(1, int(np.floor(test_size_pct * n_total)))
+    n_train = n_total - n_test
+    X_train, X_test = X_feat.iloc[:n_train], X_feat.iloc[n_train:]
+    y_train, y_test = y.iloc[:n_train], y.iloc[n_train:]
+
+    # --- Modèle : LightGBM si dispo, sinon RandomForest ---
+    model_name = None
+    proba_train = proba_test = None
+    try:
+        import lightgbm as lgb
+        model = lgb.LGBMClassifier(n_estimators=400, learning_rate=0.05, num_leaves=31,
+                                   subsample=0.9, colsample_bytree=0.9, random_state=42)
+        model.fit(X_train, y_train)
+        proba_train = model.predict_proba(X_train)[:,1]
+        proba_test  = model.predict_proba(X_test)[:,1]
+        model_name = "LightGBM"
+    except Exception:
+        from sklearn.ensemble import RandomForestClassifier
+        model = RandomForestClassifier(n_estimators=400, max_depth=None, min_samples_leaf=2, random_state=42)
+        model.fit(X_train, y_train)
+        proba_train = model.predict_proba(X_train)[:,1]
+        proba_test  = model.predict_proba(X_test)[:,1]
+        model_name = "RandomForest"
+
+    # --- AUC (si possible) ---
+    auc_train = auc_test = np.nan
+    try:
+        from sklearn.metrics import roc_auc_score
+        auc_train = roc_auc_score(y_train, proba_train) if (y_train.nunique()>1) else np.nan
+        auc_test  = roc_auc_score(y_test,  proba_test)  if (y_test.nunique()>1)  else np.nan
+    except Exception:
+        pass
+
+    # --- Série de probas sur tout l'échantillon ---
+    # On réentraîne sur tout et prédit proba sur toute la période pour affichage
+    try:
+        model.fit(X_feat, y)
+        proba_all = pd.Series(model.predict_proba(X_feat)[:,1], index=X_feat.index, name="proba_transition")
+    except Exception:
+        proba_all = pd.Series(index=X_feat.index, dtype=float, name="proba_transition")
+
+    # --- Affichage KPIs ---
+    k1, k2, k3 = st.columns(3)
+    with k1: st.metric("Modèle", model_name or "?")
+    with k2: st.metric("AUC (train)", f"{auc_train:.3f}" if np.isfinite(auc_train) else "n/a")
+    with k3: st.metric("AUC (test)",  f"{auc_test:.3f}"  if np.isfinite(auc_test)  else "n/a")
+
+    # --- Graphique des probabilités ---
+    figP, axP = plt.subplots(figsize=(12,4), dpi=120)
+    axP.plot(proba_all.index, proba_all.values, lw=1.1, label='Proba transition (t→t+H)')
+    axP.axhline(alert_thr, linestyle='--')
+    # Marquer transitions réelles
+    if len(trans_dates):
+        axP.vlines(trans_dates, ymin=0, ymax=1, linestyles=':', color='black', alpha=0.3, label='Transitions réelles')
+    axP.set_ylim(0,1)
+    axP.set_title(f"Probabilité de changement de régime — modèle {model_name}")
+    st.pyplot(figP)
+
+    # --- Proba actuelle + Alerte hedge ---
+    if len(proba_all)>0:
+        prob_today = float(proba_all.iloc[-1])
+        st.metric("Proba (aujourd'hui)", f"{prob_today*100:.1f}%")
+        if prob_today >= alert_thr:
+            st.warning("Alerte : probabilité de changement de régime élevée — envisager un hedge partiel.")
+        else:
+            st.info("Probabilité sous le seuil d'alerte.")
+
+    # --- Export CSV ---
+    out_pred = pd.concat([
+        y.rename("label_transition_nextH"),
+        proba_all
+    ], axis=1)
+    st.download_button(
+        "Télécharger (CSV) — Probabilités de transition",
+        data=out_pred.to_csv().encode('utf-8'),
+        file_name="transition_probabilities.csv",
+        mime="text/csv"
+    )
+    # --- Comparatif HMM (per-constituant) vs LightGBM ---
+    try:
+        st.subheader("Comparatif — Proba HMM (pondérée) vs Proba LightGBM")
+        if 'proba_all' in globals() and isinstance(proba_all, pd.Series) and not proba_all.empty \
+           and 'hmm_proba_stress_weighted' in globals() and isinstance(hmm_proba_stress_weighted, pd.Series) and not hmm_proba_stress_weighted.empty:
+            cmp = pd.concat([
+                proba_all.rename("LightGBM_proba"),
+                hmm_proba_stress_weighted.rename("HMM_weighted_proba")
+            ], axis=1).dropna()
+            if not cmp.empty:
+                st.line_chart(cmp)
+                corr0 = float(cmp["LightGBM_proba"].corr(cmp["HMM_weighted_proba"]))
+                c1c, c2c = st.columns(2)
+                with c1c:
+                    st.metric("Corrélation (t,t)", f"{corr0:.2f}")
+                with c2c:
+                    lead = st.slider("Décalage HMM vs LGBM (jours; + = HMM avance)", -5, 5, 0, 1, key="cmp_lead")
+                    if lead != 0:
+                        hmm_shift = hmm_proba_stress_weighted.shift(int(lead))
+                        cmp2 = pd.concat([proba_all.rename("LightGBM_proba"), hmm_shift.rename("HMM_weighted_proba")], axis=1).dropna()
+                        corrL = float(cmp2["LightGBM_proba"].corr(cmp2["HMM_weighted_proba"])) if len(cmp2)>2 else np.nan
+                        st.metric("Corrélation (avec décalage)", f"{corrL:.2f}" if np.isfinite(corrL) else "n/a")
+
+                st.markdown("**Scatter LightGBM vs HMM (contemporain)**")
+                fig_sc, ax_sc = plt.subplots(figsize=(6,5), dpi=110)
+                ax_sc.scatter(cmp["LightGBM_proba"], cmp["HMM_weighted_proba"], s=12, alpha=0.6)
+                ax_sc.set_xlabel("LightGBM proba")
+                ax_sc.set_ylabel("HMM weighted proba")
+                ax_sc.set_xlim(0,1); ax_sc.set_ylim(0,1)
+                st.pyplot(fig_sc)
+            else:
+                st.info("Pas de recouvrement temporel suffisant entre HMM (Tab 5) et LightGBM.")
+        else:
+            st.info("HMM pondéré (Tab 5) ou proba LGBM non disponible : entraîne Tab 4 et calcule Tab 5.")
+    except Exception as _e_cmp:
+        st.info(f"Comparatif HMM vs LGBM non rendu: {_e_cmp}")
+
+except Exception as _e_tab4:
+    st.warning(f"Tab 4 (Détection de transition) non rendue: {_e_tab4}")
+
+# =========================
+# TAB 5 — HMM par constituant (moyenne pondérée uniquement)
+# =========================
+try:
+    st.header("HMM par constituant — Probabilité agrégée de stress (moyenne pondérée)")
+
+    if 'pnl_by_factor' in globals() and isinstance(pnl_by_factor, pd.DataFrame) and not pnl_by_factor.empty:
+        from hmmlearn.hmm import GaussianHMM
+        cols = st.multiselect("Constituants à modéliser (HMM 1D chacun)", pnl_by_factor.columns.tolist(),
+                              default=list(pnl_by_factor.columns[:min(10, len(pnl_by_factor.columns))]))
+        hmm_states_pc = st.slider("Nb régimes (par constituant)", 2, 4, 2, 1, key="hmm_pc_states")
+
+        proba_stress_f = {}
+        for c in cols:
+            s = pnl_by_factor[c].dropna()
+            if len(s) < 50:
+                continue
+            Xc = s.values.reshape(-1,1)
+            hmmc = GaussianHMM(n_components=int(hmm_states_pc), covariance_type='full', n_iter=200, random_state=42)
+            hmmc.fit(Xc)
+            means_c = hmmc.means_.reshape(-1)
+            stress_c = int(np.argmin(means_c))
+            prob_c = pd.Series(hmmc.predict_proba(Xc)[:, stress_c], index=s.index, name=f"stress_{c}")
+            proba_stress_f[c] = prob_c
+
+        if len(proba_stress_f):
+            dfp = pd.DataFrame(proba_stress_f).reindex(pnl_by_factor.index).fillna(method='ffill')
+            w = pnl_by_factor[cols].abs().mean()
+            w = w / w.sum() if w.sum() > 0 else pd.Series(1/len(w), index=w.index)
+            hmm_proba_stress_weighted = (dfp * w).sum(axis=1).rename("hmm_proba_stress_weighted")
+            st.line_chart(hmm_proba_stress_weighted)
+            st.caption("Série exposée pour information (Tab 3 utilise uniquement LightGBM).")
+        else:
+            st.info("Pas assez de données pour estimer les HMM par constituant.")
+    else:
+        st.info("Contributions PnL indisponibles.")
+except Exception as _e_tab5:
+    st.warning(f"Tab 5 (HMM par constituant) non rendue: {_e_tab5}")
+# =========================
+# TAB 6 — Forecast & Hedge Optimizer (LightGBM proba → α → hedge plan)
+# =========================
+try:
+    st.header("Forecast & Hedge Optimizer — proba LightGBM → α → plan de hedge")
+
+    # ---- Vérifs ----
+    if 'pnl_by_factor' not in globals() or not isinstance(pnl_by_factor, pd.DataFrame) or pnl_by_factor.empty:
+        st.info("Séries PnL par constituant indisponibles.")
+    elif 'proba_all' not in globals() or not isinstance(proba_all, pd.Series) or proba_all.empty:
+        st.error("Probabilités LightGBM indisponibles. Va dans Tab 4 pour entraîner le modèle.")
+    else:
+        # ---- Inputs ----
+        c0, c1, c2, c3 = st.columns(4)
+        with c0:
+            topN = st.slider("Top N constituants/jour", 1, 20, 4, 1, key="fxhedge_topN")
+        with c1:
+            tau1 = st.slider("τ1 (→ α=0.3)", 0.0, 1.0, 0.50, 0.05, key="fxhedge_tau1")
+        with c2:
+            tau2 = st.slider("τ2 (→ α=0.6)", 0.0, 1.0, 0.70, 0.05, key="fxhedge_tau2")
+        with c3:
+            tau3 = st.slider("τ3 (→ α=1.0)", 0.0, 1.0, 0.85, 0.05, key="fxhedge_tau3")
+
+        d0, d1, d2, d3 = st.columns(4)
+        with d0:
+            apply_day = st.selectbox("Appliquer le hedge", ["Jour T", "Jour T+1"], index=0, key="fxhedge_apply")
+        with d1:
+            cost_rate = st.number_input("Coût — Rates (par DV01)", 0.0, 5.0, 0.20, 0.01, key="fxhedge_cost_rate")
+        with d2:
+            cost_xccy = st.number_input("Coût — XCCY (par DV01)", 0.0, 5.0, 0.25, 0.01, key="fxhedge_cost_xccy")
+        with d3:
+            cost_fx   = st.number_input("Coût — FX (par FX01)",   0.0, 5.0, 0.00, 0.01, key="fxhedge_cost_fx")
+
+        def alpha_from_p(p: float) -> float:
+            if not np.isfinite(p):
+                return 0.0
+            if p < tau1: return 0.0
+            if p < tau2: return 0.3
+            if p < tau3: return 0.6
+            return 1.0
+
+        # ---- Préparer séries ----
+        risk_cols_loc = list(pnl_by_factor.columns)
+        bump_s = mapping_df.reindex(risk_cols_loc)["Bump"].astype(float).where(lambda s: s.notna() & (s != 0.0))
+        proba_series = proba_all.reindex(pnl_by_factor.index).fillna(method='ffill')
+
+        def _bucket(name: str) -> str:
+            u = str(name).upper()
+            if 'FX' in u or (('FX_COLS' in globals()) and (name in FX_COLS)):
+                return 'FX'
+            if 'XCCY' in u or 'BASIS' in u:
+                return 'XCCY'
+            return 'Rates'
+
+        # ---- Construire le plan de hedge & simuler le PnL hedgé ----
+        contrib_after = pnl_by_factor.copy()
+        cost_series = pd.Series(0.0, index=pnl_by_factor.index)
+        plan_rows = []
+
+        for d in pnl_by_factor.index:
+            p = float(proba_series.get(d, 0.0))
+            a = float(alpha_from_p(p))
+            if a <= 0:  # pas de hedge
+                continue
+            pnl_row = pnl_by_factor.loc[d].reindex(risk_cols_loc)
+            top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+            # Appliquer réduction sur T ou T+1
+            target_day = d if apply_day == "Jour T" else (d + pd.Timedelta(days=1))
+            if target_day in contrib_after.index:
+                contrib_after.loc[target_day, top_names] = contrib_after.loc[target_day, top_names] * (1.0 - a)
+
+            # Coût & plan (units via DV01/FX01 = −α * PnL / Bump)
+            for c in top_names:
+                pnl_c  = float(pnl_row.get(c, 0.0))
+                bump_c = float(bump_s.get(c, np.nan))
+                if not np.isfinite(bump_c) or abs(bump_c) < 1e-12:
+                    hedge_units = np.nan
+                    unit_cost = 0.0
+                else:
+                    hedge_units = -(a * (pnl_c / bump_c))
+                    bucket = _bucket(c)
+                    unit_cost = cost_fx if bucket == 'FX' else (cost_xccy if bucket == 'XCCY' else cost_rate)
+
+                if target_day in cost_series.index and np.isfinite(hedge_units):
+                    cost_series.loc[target_day] += abs(hedge_units) * float(unit_cost)
+
+                plan_rows.append({
+                    "Date": target_day,
+                    "p_forecast": p,
+                    "alpha": a,
+                    "Constituant": c,
+                    "PnL_contrib": pnl_c,
+                    "Bump": bump_c,
+                    "HedgeUnits": hedge_units,
+                    "Bucket": _bucket(c),
+                    "UnitCost": unit_cost,
+                    "CostAlloc": (abs(hedge_units)*float(unit_cost)) if np.isfinite(hedge_units) else 0.0,
+                })
+
+        plan_df = pd.DataFrame(plan_rows)
+
+        # ---- PnL baseline vs hedgé ----
+        pnl_base  = pnl_by_factor.sum(axis=1).rename("PnL_baseline")
+        pnl_after = contrib_after.sum(axis=1).rename("PnL_gross_after") - cost_series.rename("HedgeCost").reindex(pnl_by_factor.index).fillna(0.0)
+        cum_base  = pnl_base.cumsum().rename("Cum_Base")
+        cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+        # ---- Graphique ----
+        figF, axF = plt.subplots(figsize=(12,5), dpi=120)
+        axF.plot(cum_base.index,  cum_base.values,  label="Cumul Base")
+        axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé")
+        axF.set_title("Cumulative PnL — Base vs Hedgé (Forecast-driven)")
+        axF.legend(loc='upper left')
+        st.pyplot(figF)
+
+        # ---- KPIs ----
+        k1, k2, k3 = st.columns(3)
+        with k1: st.metric("Δ Cumul (Hedgé-Base)", f"{float(cum_after.iloc[-1]-cum_base.iloc[-1]):,.0f}")
+        with k2: st.metric("Coût total hedge", f"{float(cost_series.sum()):,.0f}")
+        with k3: st.metric("% jours couverts", f"{100.0*float((proba_series.apply(alpha_from_p)>0).mean()):.1f}%")
+
+        # ---- Tables & exports ----
+        st.subheader("Plan de hedge (détaillé)")
+        if plan_df.empty:
+            st.info("Aucun hedge déclenché (probas sous seuils).")
+        else:
+            st.dataframe(
+                plan_df.sort_values(["Date","Constituant"])\
+                       .style.format({"p_forecast":"{:.2f}", "alpha":"{:.2f}", "PnL_contrib":"{:,.0f}", "Bump":"{:,.6f}", "HedgeUnits":"{:,.0f}", "UnitCost":"{:,.3f}", "CostAlloc":"{:,.0f}"})\
+                       .applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else '', subset=['PnL_contrib','HedgeUnits','CostAlloc']),
+                use_container_width=True, height=420)
+            st.download_button(
+                "Télécharger (CSV) — Plan de hedge",
+                data=plan_df.to_csv(index=False).encode('utf-8'),
+                file_name="forecast_hedge_plan.csv",
+                mime="text/csv"
+            )
+
+        st.subheader("Séries PnL — Base vs Hedgé")
+        out_series = pd.concat([pnl_base, pnl_after, cum_base, cum_after, cost_series.rename("HedgeCost")], axis=1)
+        st.download_button(
+            "Télécharger (CSV) — Séries",
+            data=out_series.to_csv().encode('utf-8'),
+            file_name="forecast_hedge_series.csv",
+            mime="text/csv"
+        )
+except Exception as _e_tab6:
+    st.warning(f"Tab 6 (Forecast & Hedge Optimizer) non rendue: {_e_tab6}")
+
