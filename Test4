@@ -1,0 +1,39 @@
+# =========================
+# TAB 3 — KNN multi-scénarios (loop on all Coeff columns)
+# =========================
+with tab3:
+    st.header("KNN — Régimes & Hedge (multi-scénarios du DataType sélectionné)")
+
+    # --- Paramètres ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_neighbors_knn = st.slider("KNN — n_neighbors", 2, 15, 5)
+    with c2:
+        top_n = st.slider("Top N constituants par date", 1, 20, 4)
+    with c3:
+        alpha_cov = st.slider("α — % à couvrir", 0, 100, 100, 5)/100.0
+
+    scen_cols = [c for c in coeff_df.columns if c != "DataType"]
+    st.info(f"Analyse pour {dtype} sur {len(scen_cols)} scénarios : {', '.join(scen_cols)}")
+
+    # Boucle sur les scénarios disponibles
+    for scen_coeff in scen_cols:
+        st.markdown(f"## 🔹 Scénario : **{scen_coeff}**")
+
+        # --- Coeff/Bump par scénario ---
+        coeff_s = coeff_df.set_index("DataType")[scen_coeff].astype(float).reindex(risk_cols)
+        bump_s  = mapping_df.reindex(risk_cols)["Bump"].astype(float).replace(0.0, np.nan)
+        dv01_per_unit = (coeff_s / bump_s).replace([np.inf, -np.inf], np.nan)
+
+        # --- KNN ---
+        X = pnl_by_factor.fillna(0.0)
+        scaler = StandardScaler()
+        Xz = scaler.fit_transform(X)
+        y = np.where(net_daily >= 0, 1, -1)
+        knn = KNeighborsClassifier(n_neighbors=n_neighbors_knn)
+        knn.fit(Xz, y)
+        y_hat = knn.predict(Xz)
+        labels_knn = pd.Series(y_hat, index=X.index, name="Regime")
+        entries = [d for i, d in enumerate(labels_knn.index[1:]) if labels_knn.iloc[i+1] < 0 < labels_knn.iloc[i]]
+
+        # --- Graphique des rég
