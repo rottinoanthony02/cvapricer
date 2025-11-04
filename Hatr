@@ -1,0 +1,329 @@
+# =========================
+# TAB 3 — Market Regimes (HMM) & Hedge Plan — Clear UI + Visuals
+# =========================
+try:
+    import seaborn as sns
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from matplotlib.ticker import FuncFormatter
+
+    st.header("Tab 3 — Market Regimes (HMM) & Hedge Plan")
+
+    # ---------- Small helpers (local) ----------
+    def format_yaxis_plain(ax):
+        try:
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}"))
+        except Exception:
+            pass
+
+    def auto_xticks(ax, idx):
+        try:
+            import matplotlib.dates as mdates
+            idx = pd.to_datetime(idx)
+            span_days = (idx.max() - idx.min()).days if len(idx) else 0
+            if span_days <= 120:
+                ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=1))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%d-%b"))
+            elif span_days <= 540:
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+                ax.xaxis.set_majorFormatter(mdates.DateFormatter("%b %Y"))
+            else:
+                ax.xaxis.set_major_locator(mdates.MonthLocator(interval=3))
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+        except Exception:
+            pass
+
+    def bucket_of(name: str) -> str:
+        u = str(name).upper()
+        if ('FX' in u) or ((FX_COLS is not None) and (name in FX_COLS)):
+            return 'FX'
+        if ('XCCY' in u) or ('BASIS' in u):
+            return 'XCCY'
+        return 'Rates'
+
+    # ---------- UI: KPI header ----------
+    k0, k1, k2, k3 = st.columns(4)
+    with k0: st.metric("DataType", f"{dtype}")
+    with k1: st.metric("Dates", f"{net_daily.index.min().date()} → {net_daily.index.max().date()}")
+    with k2: st.metric("Days", f"{len(net_daily):,}")
+    with k3: st.metric("Constituants", f"{pnl_by_factor.shape[1]:,}")
+
+    # ---------- STEP 1: Model calibration ----------
+    st.markdown("<h4 style='color:#1E90FF'>🧠 Step 1 — HMM Calibration</h4>", unsafe_allow_html=True)
+    with st.expander("⚙️ Model parameters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            hmm_states = st.slider("Nb of regimes (K)", 2, 6, 3, 1, key="tab3_k")
+        with c2:
+            n_iter = st.number_input("EM iterations (n_iter)", 50, 2000, 300, 50, key="tab3_niter")
+        with c3:
+            use_z = st.checkbox("Standardize constituents (z-score)", value=True, key="tab3_usez")
+        with c4:
+            topN = st.slider("Top-N constituents per date", 1, 20, 4, 1, key="tab3_topN")
+
+    # ---------- STEP 2: Hedge settings ----------
+    st.markdown("<h4 style='color:#6A5ACD'>🛡️ Step 2 — Hedge Settings</h4>", unsafe_allow_html=True)
+    with st.expander("🛠️ Hedge thresholds & costs", expanded=True):
+        d1, d2, d3, d4 = st.columns(4)
+        with d1:
+            tau1 = st.slider("τ1 (→ α=0)", 0.0, 1.0, 0.50, 0.05, key="tab3_tau1")
+        with d2:
+            tau2 = st.slider("τ2 (→ α=0.3)", 0.0, 1.0, 0.70, 0.05, key="tab3_tau2")
+        with d3:
+            tau3 = st.slider("τ3 (→ α=1.0)", 0.0, 1.0, 0.85, 0.05, key="tab3_tau3")
+        with d4:
+            apply_day = st.selectbox("Apply hedge on", ["Day T", "Day T+1"], index=0, key="tab3_apply_day")
+
+        e1, e2, e3 = st.columns(3)
+        with e1:
+            cost_rate = st.number_input("Cost — Rates (per DV01)", 0.0, 5.0, 0.20, 0.01, key="tab3_cost_rate")
+        with e2:
+            cost_xccy = st.number_input("Cost — XCCY (per DV01)", 0.0, 5.0, 0.25, 0.01, key="tab3_cost_xccy")
+        with e3:
+            cost_fx = st.number_input("Cost — FX (per FX01)", 0.0, 5.0, 0.00, 0.01, key="tab3_cost_fx")
+
+    def alpha_from_p(p: float) -> float:
+        if not np.isfinite(p): return 0.0
+        if p < tau1: return 0.0
+        if p < tau2: return 0.3
+        if p < tau3: return 0.6
+        return 1.0
+
+    # ---------- Fit HMM on constituents ----------
+    X_df = pnl_by_factor.copy().replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if X_df.empty:
+        st.info("Not enough valid contributions to run HMM.")
+        st.stop()
+    idx_obs = X_df.index
+
+    if use_z:
+        scaler = StandardScaler()
+        X_use = scaler.fit_transform(X_df.values)
+    else:
+        X_use = X_df.values
+
+    hmm = GaussianHMM(n_components=int(hmm_states), covariance_type='full', n_iter=int(n_iter), random_state=42)
+    hmm.fit(X_use)
+    states = pd.Series(hmm.predict(X_use), index=idx_obs, name="state")
+    post = pd.DataFrame(hmm.predict_proba(X_use), index=idx_obs,
+                        columns=[f"Regime {i}" for i in range(int(hmm_states))])
+
+    # stress regime = lowest mean net PnL
+    net_on_state = pd.concat([net_daily.reindex(idx_obs), states], axis=1).dropna()
+    means_by_state = net_on_state.groupby('state')['NetDailyPnL'].mean()
+    stress_regime = int(means_by_state.idxmin()) if len(means_by_state) else 0
+    hmm_proba_stress = post.iloc[:, stress_regime].rename("p_stress")
+
+    # entries into stress
+    entries = []
+    prev = None
+    for dt, lab in states.items():
+        if prev is None:
+            prev = lab; continue
+        if (lab == stress_regime) and (prev != stress_regime):
+            entries.append(dt)
+        prev = lab
+
+    # ---------- STEP 3: Visualisation des régimes ----------
+    st.markdown("<h4 style='color:#2E8B57'>📊 Step 3 — Regime Visualization</h4>", unsafe_allow_html=True)
+    figR, axR = plt.subplots(figsize=(12,5), dpi=120)
+    axR.plot(net_daily.index, net_daily.values, lw=1.1, label='Net Daily PnL')
+    cmap = plt.cm.get_cmap('Set2', int(hmm_states))
+    for s_id in range(int(hmm_states)):
+        mask = (states == s_id).reindex(net_daily.index).fillna(False)
+        axR.fill_between(net_daily.index, net_daily.values, 0, where=mask, color=cmap(s_id), alpha=0.12, label=f'Regime {s_id}')
+    if len(entries):
+        axR.vlines(entries, ymin=min(float(net_daily.min()),0.0), ymax=max(float(net_daily.max()),0.0),
+                   linestyles=':', color='black', alpha=0.6, label='Stress entries')
+    format_yaxis_plain(axR); auto_xticks(axR, net_daily.index)
+    axR.grid(alpha=0.25)
+    axR.set_title("HMM — Market Regimes (colored by state)")
+    axR.legend(loc='upper left', ncols=2)
+    st.pyplot(figR)
+
+    # Heatmap: average contrib by state
+    with st.expander("Heatmap — Average contribution per constituent & state", expanded=False):
+        mean_by_state = pnl_by_factor.join(states).groupby('state').mean().T
+        if not mean_by_state.empty:
+            figH, axH = plt.subplots(figsize=(10, 6), dpi=120)
+            sns.heatmap(mean_by_state, cmap="RdYlGn", center=0.0, ax=axH)
+            axH.set_title("Average PnL Contribution per Constituent by HMM State")
+            st.pyplot(figH)
+        else:
+            st.info("Not enough data to compute state-wise averages.")
+
+    # Boxplot: distribution of net PnL by state
+    with st.expander("Distribution — Net PnL per regime (boxplot)", expanded=False):
+        if not net_on_state.empty:
+            figB, axB = plt.subplots(figsize=(9,4), dpi=120)
+            sns.boxplot(x=net_on_state['state'], y=net_on_state['NetDailyPnL'], ax=axB, palette="Set2")
+            format_yaxis_plain(axB)
+            axB.set_xlabel("HMM State"); axB.set_title("Distribution of Net Daily PnL by Regime")
+            axB.grid(axis='y', alpha=0.25)
+            st.pyplot(figB)
+        else:
+            st.info("Insufficient aligned data for boxplot.")
+
+    # α(t) curve
+    with st.expander("Hedge intensity — α(t) vs HMM stress probability", expanded=True):
+        alpha_series = hmm_proba_stress.apply(alpha_from_p)
+        figA, axA = plt.subplots(figsize=(12,3.5), dpi=120)
+        axA.plot(hmm_proba_stress.index, hmm_proba_stress.values, label="p_stress (HMM)", lw=1.0)
+        axA.plot(alpha_series.index, alpha_series.values, label="α(t)", lw=1.2)
+        auto_xticks(axA, hmm_proba_stress.index)
+        axA.set_ylim(-0.05, 1.05); axA.grid(alpha=0.25); axA.legend()
+        axA.set_title("Hedge intensity driven by HMM stress probability")
+        st.pyplot(figA)
+
+    # Scatter PnL vs α
+    with st.expander("Diagnostic — Is α higher when PnL worsens? (scatter)", expanded=False):
+        df_sc = pd.concat([net_daily.rename("PnL"), alpha_series.rename("alpha")], axis=1).dropna()
+        if not df_sc.empty:
+            figS, axS = plt.subplots(figsize=(6,4.5), dpi=110)
+            axS.scatter(df_sc["PnL"], df_sc["alpha"], s=18, alpha=0.5)
+            format_yaxis_plain(axS)
+            axS.set_xlabel("Net Daily PnL"); axS.set_ylabel("α (hedge fraction)")
+            axS.grid(alpha=0.25)
+            st.pyplot(figS)
+        else:
+            st.info("Not enough points for scatter.")
+
+    # ---------- STEP 4: Hedge computation ----------
+    st.markdown("<h4 style='color:#B22222'>💡 Step 4 — Hedge Computation & Impact</h4>", unsafe_allow_html=True)
+
+    # Bumps & target names per day
+    risk_cols_loc = list(pnl_by_factor.columns)
+    bump_s = mapping_df.reindex(risk_cols_loc)["Bump"].astype(float).where(lambda s: s.notna() & (s != 0.0))
+
+    # α time series
+    proba_series = hmm_proba_stress.reindex(pnl_by_factor.index).fillna(method='ffill')
+    alpha_by_day = proba_series.apply(alpha_from_p)
+
+    # Simulate hedge: reduce TopN contributions by (1-α) on target day and compute costs
+    contrib_after = pnl_by_factor.copy()
+    cost_series = pd.Series(0.0, index=pnl_by_factor.index)
+    plan_rows = []
+
+    for d in pnl_by_factor.index:
+        a = float(alpha_by_day.get(d, 0.0))
+        if a <= 0: 
+            continue
+        pnl_row = pnl_by_factor.loc[d].reindex(risk_cols_loc)
+        top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+        target_day = d if apply_day == "Day T" else (d + pd.Timedelta(days=1))
+        if target_day in contrib_after.index:
+            contrib_after.loc[target_day, top_names] = contrib_after.loc[target_day, top_names] * (1.0 - a)
+
+        # cost & plan (units = −α * PnL / bump)
+        for cst in top_names:
+            pnl_c  = float(pnl_row.get(cst, 0.0))
+            bump_c = float(bump_s.get(cst, np.nan))
+            if not np.isfinite(bump_c) or abs(bump_c) < 1e-12:
+                hedge_units = np.nan; unit_cost = 0.0
+            else:
+                hedge_units = -(a * (pnl_c / bump_c))
+                unit_cost = cost_fx if bucket_of(cst) == 'FX' else (cost_xccy if bucket_of(cst) == 'XCCY' else cost_rate)
+
+            if target_day in cost_series.index and np.isfinite(hedge_units):
+                cost_series.loc[target_day] += abs(hedge_units) * float(unit_cost)
+
+            plan_rows.append({
+                "Date": target_day,
+                "alpha": a,
+                "Constituent": cst,
+                "Bucket": bucket_of(cst),
+                "PnL_contrib": pnl_c,
+                "Bump": bump_c,
+                "HedgeUnits": hedge_units,
+                "UnitCost": unit_cost,
+                "CostAlloc": (abs(hedge_units) * float(unit_cost)) if np.isfinite(hedge_units) else 0.0
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    # Recompute PnL baseline vs hedged
+    pnl_base  = pnl_by_factor.sum(axis=1).rename("PnL_baseline")
+    pnl_after = contrib_after.sum(axis=1).rename("PnL_after") - cost_series.rename("HedgeCost").reindex(pnl_by_factor.index).fillna(0.0)
+    cum_base  = pnl_base.cumsum().rename("Cum_Base")
+    cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+    # Impact chart (with cumulative hedge cost on 2nd axis)
+    figF, axF = plt.subplots(figsize=(12,5), dpi=120)
+    axF.plot(cum_base.index,  cum_base.values,  label="Cumulative Base")
+    axF.plot(cum_after.index, cum_after.values, label="Cumulative Hedged")
+    format_yaxis_plain(axF); auto_xticks(axF, cum_after.index)
+    axF.grid(alpha=0.25)
+    axF.set_title("Cumulative PnL — Base vs Hedged (HMM-driven)")
+    ax2 = axF.twinx()
+    ax2.plot(cost_series.cumsum().index, cost_series.cumsum().values, alpha=0.5, label="Cum Hedge Cost")
+    ax2.set_ylabel("Cum Hedge Cost")
+    figF.legend(loc='upper left')
+    st.pyplot(figF)
+
+    # KPI summary
+    s1, s2, s3, s4 = st.columns(4)
+    with s1: st.metric("Stress Regime", f"{stress_regime}")
+    with s2: st.metric("Stress entries", f"{len(entries)}")
+    with s3: st.metric("Δ Cumul (Hedged - Base)", f"{float(cum_after.iloc[-1]-cum_base.iloc[-1]):,.0f}")
+    with s4: st.metric("Total Hedge Cost", f"{float(cost_series.sum()):,.0f}")
+
+    # Tables
+    st.markdown("### 📋 Regime Summary")
+    hmm_stats = (
+        net_on_state.groupby('state')['NetDailyPnL']
+        .agg(n_days='size', mean_pnl='mean', std_pnl='std')
+        .sort_index()
+    )
+    st.dataframe(hmm_stats.style.format({'n_days':'{:.0f}', 'mean_pnl':'{:,.0f}', 'std_pnl':'{:,.0f}'}), use_container_width=True)
+
+    st.markdown("### 💼 Hedge Plan (TopN / day)")
+    if plan_df.empty:
+        st.info("No hedges applied (α=0 across the period).")
+    else:
+        st.dataframe(
+            plan_df.sort_values(["Date","Constituent"])
+                   .style.format({"alpha":"{:.2f}","PnL_contrib":"{:,.0f}","Bump":"{:,.6f}","HedgeUnits":"{:,.0f}","UnitCost":"{:,.3f}","CostAlloc":"{:,.0f}"})
+                   .applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else '', subset=['PnL_contrib','HedgeUnits','CostAlloc']),
+            use_container_width=True, height=420
+        )
+
+    st.markdown("### 📊 Hedge Impact Summary")
+    impact = pd.DataFrame({
+        "PnL baseline (cum)": [float(cum_base.iloc[-1])],
+        "PnL hedged (cum)":   [float(cum_after.iloc[-1])],
+        "ΔPnL (cum)":         [float(cum_after.iloc[-1]-cum_base.iloc[-1])],
+        "Total hedge cost":   [float(cost_series.sum())]
+    })
+    st.dataframe(impact.style.format("{:,.0f}"), use_container_width=True)
+
+    # ---------- Exports ----------
+    with st.expander("⬇️ Export"):
+        st.download_button(
+            "Hedge Plan (CSV)",
+            data=plan_df.to_csv(index=False).encode('utf-8'),
+            file_name=f"hmm_hedge_plan_{dtype}.csv",
+            mime="text/csv"
+        )
+        out_series = pd.concat([pnl_base, pnl_after, cum_base, cum_after, cost_series.rename("HedgeCost")], axis=1)
+        st.download_button(
+            "Series — Base vs Hedged (CSV)",
+            data=out_series.to_csv().encode('utf-8'),
+            file_name=f"hmm_series_{dtype}.csv",
+            mime="text/csv"
+        )
+
+    # ---------- Optional: FX diagnostics ----------
+    with st.expander("🔎 FX diagnostics"):
+        try:
+            fx_list = [c for c in (FX_COLS or []) if c in pnl_by_factor.columns]
+        except Exception:
+            fx_list = []
+        st.write("FX columns detected:", ", ".join(fx_list) if fx_list else "(none)")
+        if len(fx_list) and not mkt_change.empty:
+            recent = mkt_change.index[-5:]
+            st.write("Recent FX ΔS used in sizing:")
+            st.dataframe(mkt_change[fx_list].loc[recent])
+
+except Exception as _e_tab3_clear:
+    st.warning(f"Tab 3 (clear UI) not rendered: {_e_tab3_clear}")
