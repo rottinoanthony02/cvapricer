@@ -1,0 +1,144 @@
+# =========================
+# PLAN DE HEDGE (COMPLET, AVEC DV01→FX01 POUR XHEDGE FX)
+# =========================
+from functools import lru_cache
+
+# --- Paramètres pour corr/β FX ---
+dv01fx_win = st.slider("Fenêtre corr (jours) pour β (XHEDGE FX)", 20, 180, 60, 5, key="dv01fx_win_fx")
+
+@lru_cache(maxsize=2048)
+def _beta_fx_pair(rate_col: str, fx_col: str, end_date_str: str, win: int) -> tuple[float, float]:
+    """Calcule (ρ, β) sur une fenêtre [end-win+1, end] en supposant Δtaux en bp et ΔFX en %."""
+    end_date = pd.to_datetime(end_date_str)
+    start = end_date - pd.Timedelta(days=win - 1)
+    idx = mkt_change.index[(mkt_change.index >= start) & (mkt_change.index <= end_date)]
+    if len(idx) < max(10, win // 2):
+        return (np.nan, np.nan)
+
+    if rate_col not in mkt_change.columns or fx_col not in mkt_change.columns:
+        return (np.nan, np.nan)
+
+    r = (mkt_change.loc[idx, rate_col]).astype(float) * 1e-4   # bp → décimal
+    f = (mkt_change.loc[idx, fx_col]).astype(float) * 1e-2     # %  → décimal
+    pair = pd.concat([r.rename("r"), f.rename("fx")], axis=1).dropna()
+    if len(pair) < max(10, win // 2) or pair["r"].std() == 0 or pair["fx"].std() == 0:
+        return (np.nan, np.nan)
+
+    rho = float(pair["r"].corr(pair["fx"]))
+    beta = float(rho * (pair["r"].std() / pair["fx"].std()))
+    return (rho, beta)
+
+
+# --- Boucle principale (inchangée sauf FX sizing) ---
+cost_series = pd.Series(0.0, index=pnl_by_factor.index)
+plan_rows = []
+risk_cols_loc = list(pnl_by_factor.columns)
+
+for d in pnl_df.index:
+    pnl_row = pnl_df.loc[d].reindex(risk_cols_loc)
+    top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+    if alpha_df is not None:
+        alpha_row = alpha_df.loc[d].reindex(risk_cols_loc).fillna(0.0)
+    else:
+        a_g = float(alpha_global.get(d, 0.0)) if "alpha_global" in locals() else 0.0
+        alpha_row = pd.Series(a_g, index=risk_cols_loc, dtype=float)
+
+    target_day = d if apply_day == "Jour T" else (d + pd.Timedelta(days=1))
+    mkt_win = None
+    if use_cross:
+        w_start = d - pd.Timedelta(days=int(win_corr) - 1)
+        window_idx = pnl_df.index[(pnl_df.index >= w_start) & (pnl_df.index <= d)]
+        mkt_win = mkt_change.reindex(window_idx).reindex(columns=risk_cols_loc).dropna(how="any")
+        if mkt_win.empty:
+            mkt_win = None
+
+    for c_target in top_names:
+        a_j = float(alpha_row.get(c_target, 0.0))
+        if a_j <= 0.0:
+            continue
+
+        risk_c = float(risk_ts_loc.loc[d, c_target]) if (
+            c_target in risk_ts_loc.columns and d in risk_ts_loc.index
+        ) else np.nan
+        used_proxy = c_target
+        gamma = 1.0
+
+        # Cross-hedge marché (inchangé)
+        if use_cross and _bucket(c_target) == "XCCY" and (mkt_win is not None) and (
+            c_target in mkt_win.columns
+        ) and (len(mkt_win) >= max(15, int(win_corr) // 2)):
+            y_m = mkt_win[c_target].values.reshape(-1, 1)
+            Xc = mkt_win.drop(columns=[c_target])
+            corr = Xc.corrwith(mkt_win[c_target]).abs().sort_values(ascending=False).dropna()
+            corr = corr[[j for j in corr.index if _bucket(j) in ("Rates", "FX")]]
+            corr = corr[corr >= float(min_abs_corr)]
+            if not corr.empty:
+                best = corr.index[0]
+                Xr = Xc[[best]].values.reshape(-1, 1)
+                reg = LinearRegression(fit_intercept=False)
+                reg.fit(Xr, y_m)
+                gamma = float(reg.coef_[0][0])
+                used_proxy = best
+
+        bucket = _bucket(used_proxy)
+        unit_cost = cost_rate if bucket == "Rates" else (cost_xccy if bucket == "XCCY" else cost_fx)
+        hedge_units = np.nan
+        extra = {"Rho": np.nan, "Beta": np.nan, "FX01_equiv": np.nan}
+
+        # ======== Cas spécial : XHEDGE vers un FX ========
+        is_xhedge_fx = (used_proxy != c_target) and (bucket == "FX")
+        if is_xhedge_fx and np.isfinite(risk_c):
+            rho, beta = _beta_fx_pair(
+                rate_col=c_target, fx_col=used_proxy,
+                end_date_str=str(pd.to_datetime(d).date()), win=int(dv01fx_win)
+            )
+            if np.isfinite(beta):
+                fx01_equiv = risk_c * beta * 100.0  # DV01(par bp) → FX01 par +1% FX
+                hedge_units = -a_j * fx01_equiv
+                extra.update({"Rho": rho, "Beta": beta, "FX01_equiv": fx01_equiv})
+            else:
+                hedge_units = -a_j * gamma * risk_c
+        else:
+            hedge_units = -a_j * gamma * risk_c if np.isfinite(risk_c) else np.nan
+
+        # Coût (booké en T)
+        if target_day in cost_series.index and np.isfinite(hedge_units):
+            cost_series.loc[target_day] += abs(hedge_units) * float(unit_cost)
+
+        plan_rows.append({
+            "Date": target_day,
+            "Mode": ("XHEDGE-1" if used_proxy != c_target else "AUTO"),
+            "Constituant_target": c_target,
+            "alpha": a_j,
+            "Risk_target": risk_c,
+            "Proxy": used_proxy,
+            "Gamma": float(gamma),
+            "HedgeUnits": hedge_units,
+            "Bucket": bucket,
+            "UnitCost": unit_cost,
+            "CostAlloc": (abs(hedge_units) * unit_cost) if np.isfinite(hedge_units) else 0.0,
+            **extra
+        })
+
+# --- Construction finale ---
+plan_df = pd.DataFrame(plan_rows)
+
+st.subheader("Plan de hedge (détaillé)")
+
+if plan_df.empty:
+    st.info("Aucun hedge déclenché (seuils non atteints).")
+else:
+    fmt_cols = {
+        "alpha": "{:.2f}", "Risk_target": "{:.0f}", "Gamma": "{:.3f}",
+        "HedgeUnits": "{:,.0f}", "UnitCost": "{:.3f}", "CostAlloc": "{:,.0f}",
+        "Rho": "{:.3f}", "Beta": "{:.3f}", "FX01_equiv": "{:,.0f}",
+    }
+
+    st.dataframe(
+        plan_df.sort_values(["Date", "Constituant_target", "Proxy"])\
+               .style.format(fmt_cols)
+               .applymap(lambda v: "color:red;" if isinstance(v, (int, float)) and v < 0 else "",
+                         subset=["Risk_target", "HedgeUnits", "CostAlloc"]),
+        use_container_width=True, height=420
+    )
