@@ -1,0 +1,270 @@
+# =========================
+# TAB 3 — Régimes HMM + Détection de hedge (seuils→α) + Cross-Hedge marché (1 proxy Rates/FX) + Positions persistantes
+# =========================
+with tab3:
+    st.subheader("Régimes (HMM) + Détection de hedge + Cross-hedge marché (1 proxy) — Exposition portée")
+
+    # --- Paramètres HMM & Hedge ---
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        hmm_states = st.slider("Nb régimes (HMM)", 2, 6, 3, 1, key="tab3_hmm_states")
+    with c2:
+        n_iter = st.number_input("n_iter (EM)", 50, 2000, 300, 50, key="tab3_hmm_niter")
+    with c3:
+        topN = st.slider("Top N constituants / jour", 1, 20, 4, 1, key="tab3_topN")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        tau1 = st.slider("Seuil τ1 (→ α=0.3)", 0.0, 1.0, 0.50, 0.05, key="tab3_tau1")
+    with d2:
+        tau2 = st.slider("Seuil τ2 (→ α=0.6)", 0.0, 1.0, 0.70, 0.05, key="tab3_tau2")
+    with d3:
+        tau3 = st.slider("Seuil τ3 (→ α=1.0)", 0.0, 1.0, 0.85, 0.05, key="tab3_tau3")
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        cost_rate = st.number_input("Coût — Rates (par DV01)", 0.0, 5.0, 0.20, 0.01, key="tab3_cost_rate")
+    with e2:
+        cost_xccy = st.number_input("Coût — XCCY (par DV01)", 0.0, 5.0, 0.25, 0.01, key="tab3_cost_xccy")
+    with e3:
+        cost_fx   = st.number_input("Coût — FX (par FX01)",   0.0, 5.0, 0.00, 0.01, key="tab3_cost_fx")
+
+    # --- Choix du signal ---
+    s1, s2 = st.columns([2,1])
+    with s1:
+        mode_signal = st.selectbox(
+            "Signal de hedge",
+            ["Global (HMM p_stress)", "Par constituant — Jump (|Δcontrib|/MAD)", "Par constituant — Vol (σ roulante)"],
+            index=0, key="tab3_signal_mode"
+        )
+    with s2:
+        win_sig = st.slider("Fenêtre rolling (jours) signal par constituant", 5, 60, 20, 1, key="tab3_win_sig")
+
+    # --- Cross-hedge (ΔMARCHÉ) ---
+    x1, x2, x3 = st.columns(3)
+    with x1:
+        use_cross = st.checkbox("Cross-hedge par corrélation (sur ΔMARCHÉ)", value=True, key="tab3_xhedge")
+    with x2:
+        win_corr = st.slider("Fenêtre corr (jours)", 20, 180, 60, 5, key="tab3_win_corr")
+    with x3:
+        min_abs_corr = st.slider("Seuil |corr| min", 0.0, 1.0, 0.40, 0.05, key="tab3_min_corr")
+
+    # --- HMM multivarié ---
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import LinearRegression
+
+    X_df = pnl_by_factor.copy().replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    idx_obs = X_df.index
+    scaler = StandardScaler()
+    X_use = scaler.fit_transform(X_df.values)
+
+    hmm = GaussianHMM(n_components=int(hmm_states), covariance_type='full', n_iter=int(n_iter), random_state=42)
+    hmm.fit(X_use)
+    states = pd.Series(hmm.predict(X_use), index=idx_obs, name="state")
+    post = pd.DataFrame(hmm.predict_proba(X_use), index=idx_obs, columns=[f"Regime {i}" for i in range(int(hmm_states))])
+
+    # Régime "stress" = plus faible moyenne de NetDailyPnL
+    net_on_state = pd.concat([net_daily.reindex(idx_obs), states], axis=1).dropna()
+    means_by_state = net_on_state.groupby('state')['NetDailyPnL'].mean()
+    stress_regime = int(means_by_state.idxmin()) if len(means_by_state)>0 else 0
+    hmm_proba_stress = post.iloc[:, stress_regime].rename("hmm_proba_stress")
+
+    # Graphique régimes
+    figR, axR = plt.subplots(figsize=(12,5), dpi=120)
+    axR.plot(net_daily.index, net_daily.values, lw=1.1, label='PnL quotidien')
+    cmap = plt.cm.get_cmap('tab10', int(hmm_states))
+    for s_id in range(int(hmm_states)):
+        mask = states == s_id
+        axR.fill_between(net_daily.index, net_daily.values, 0,
+                         where=mask.reindex(net_daily.index).fillna(False),
+                         color=cmap(s_id), alpha=0.12, label=f'Regime {s_id}')
+    auto_xticks(axR, net_daily.index); format_yaxis_plain(axR)
+    axR.set_title('HMM multivarié — Régimes & intensité (standardisé)')
+    axR.legend(loc='upper left', ncols=2)
+    st.pyplot(figR)
+
+    # ---------- Détection → α ----------
+    eps = 1e-12
+    p_stress_series = hmm_proba_stress.reindex(pnl_by_factor.index).ffill().rename("p_stress")
+
+    diff_abs = pnl_by_factor.diff().abs()
+    med_rolling = pnl_by_factor.rolling(win_sig, min_periods=max(5, win_sig//2)).median()
+    mad_rolling = (pnl_by_factor - med_rolling).abs().rolling(win_sig, min_periods=max(5, win_sig//2)).median()
+    sig_jump_df = (diff_abs / (mad_rolling + eps))
+    sig_jump_df = sig_jump_df.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+
+    std_roll = pnl_by_factor.rolling(win_sig, min_periods=max(5, win_sig//2)).std()
+    sig_vol_df = std_roll.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+
+    def map_to_alpha(series_like: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame(index=series_like.index, columns=series_like.columns, dtype=float)
+        out[series_like <  tau1] = 0.0
+        out[(series_like >= tau1) & (series_like <  tau2)] = 0.3
+        out[(series_like >= tau2) & (series_like <  tau3)] = 0.6
+        out[series_like >= tau3] = 1.0
+        return out
+
+    if mode_signal == "Global (HMM p_stress)":
+        alpha_global = p_stress_series.apply(
+            lambda p: 0.0 if not np.isfinite(p) else (0.0 if p < tau1 else (0.3 if p < tau2 else (0.6 if p < tau3 else 1.0)))
+        )
+        alpha_df = None
+    elif mode_signal == "Par constituant — Jump (|Δcontrib|/MAD)":
+        alpha_df = map_to_alpha(sig_jump_df.reindex(pnl_by_factor.index).fillna(0.0)); alpha_global = None
+    else:
+        alpha_df = map_to_alpha(sig_vol_df.reindex(pnl_by_factor.index).fillna(0.0));  alpha_global = None
+
+    # ---------- Cross-hedge vs self-hedge ----------
+    risk_cols_loc = list(pnl_by_factor.columns)
+    pnl_df = pnl_by_factor.copy()
+    risk_ts_loc = risk_ts.reindex(pnl_df.index).reindex(columns=risk_cols_loc)
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if 'FX' in u or (name in FX_COLS): return 'FX'
+        if 'XCCY' in u or 'BASIS' in u:     return 'XCCY'
+        return 'Rates'
+
+    plan_rows = []
+
+    for d in pnl_df.index:
+        pnl_row = pnl_df.loc[d].reindex(risk_cols_loc)
+        top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+        if alpha_df is not None:
+            alpha_row = alpha_df.loc[d].reindex(risk_cols_loc).fillna(0.0)
+        else:
+            a_g = float(alpha_global.get(d, 0.0)) if 'alpha_global' in locals() else 0.0
+            alpha_row = pd.Series(a_g, index=risk_cols_loc, dtype=float)
+
+        # === EXPOSURE ON T ===
+        target_day = d  # exposure starts same day
+
+        # window of market changes for correlation/regression
+        mkt_win = None
+        if use_cross:
+            w_start = d - pd.Timedelta(days=int(win_corr)-1)
+            window_idx = pnl_df.index[(pnl_df.index >= w_start) & (pnl_df.index <= d)]
+            mkt_win = mkt_change.reindex(window_idx).reindex(columns=risk_cols_loc).dropna(how="any")
+            if mkt_win.empty:
+                mkt_win = None
+
+        for c_target in top_names:
+            a_j = float(alpha_row.get(c_target, 0.0))
+            if a_j <= 0.0:
+                continue
+
+            risk_c = float(risk_ts_loc.loc[d, c_target]) if (c_target in risk_ts_loc.columns and d in risk_ts_loc.index) else np.nan
+            used_proxy = c_target
+            gamma = 1.0
+
+            # regression on ΔMARCHÉ (unchanged logic)
+            if use_cross and _bucket(c_target) == 'XCCY' and (mkt_win is not None) and (c_target in mkt_win.columns) and (len(mkt_win) >= max(15, int(win_corr)//2)):
+                y_m = mkt_win[c_target].values.reshape(-1, 1)
+                Xc  = mkt_win.drop(columns=[c_target])
+                corr = Xc.corrwith(mkt_win[c_target]).abs().sort_values(ascending=False).dropna()
+                corr = corr[[j for j in corr.index if _bucket(j) in ('Rates','FX')]]
+                corr = corr[corr >= float(min_abs_corr)]
+                if not corr.empty:
+                    best = corr.index[0]
+                    Xr = Xc[[best]].values.reshape(-1, 1)
+                    reg = LinearRegression(fit_intercept=False)
+                    reg.fit(Xr, y_m)
+                    gamma = float(reg.coef_[0][0])
+                    used_proxy = best
+
+            hedge_units = (- a_j * gamma * risk_c) if np.isfinite(risk_c) else np.nan
+            bucket = _bucket(used_proxy)
+            unit_cost = (cost_rate if bucket=='Rates' else (cost_xccy if bucket=='XCCY' else cost_fx))
+
+            # Costs booked on T (decision date d); exposure starts on T (target_day=d)
+            plan_rows.append({
+                "Date": target_day,
+                "CostDate": d,
+                "Mode": ("XHEDGE-1" if used_proxy != c_target else "AUTO"),
+                "Constituant_target": c_target,
+                "alpha": a_j,
+                "Risk_target": risk_c,
+                "Proxy": used_proxy,
+                "Gamma": float(gamma),
+                "HedgeUnits": hedge_units,
+                "Bucket": bucket,
+                "UnitCost": unit_cost,
+                "CostAlloc": (abs(hedge_units)*unit_cost) if np.isfinite(hedge_units) else 0.0
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    # --- Build hedge positions timeline (H) starting on T ---
+    if not plan_df.empty:
+        hedge_delta = (
+            plan_df.groupby(["Date","Proxy"])['HedgeUnits']
+                   .sum().unstack(fill_value=0.0)
+        )
+        hedge_delta = hedge_delta.reindex(pnl_df.index.union(hedge_delta.index)).sort_index()
+        hedge_delta = hedge_delta.reindex(columns=pnl_by_factor.columns, fill_value=0.0)
+        H = hedge_delta.cumsum()
+    else:
+        H = pd.DataFrame(0.0, index=pnl_df.index, columns=pnl_by_factor.columns)
+
+    # --- COST SERIES: booked ONLY on T, aligned to Tab1 baseline timeline ---
+    base_index = pnl_by_factor.index
+    if plan_df.empty:
+        cost_series = pd.Series(0.0, index=base_index)
+    else:
+        cost_series = (
+            plan_df.groupby("CostDate")["CostAlloc"]
+                   .sum()
+                   .reindex(base_index)
+                   .fillna(0.0)
+        )
+
+    # --- BASELINE PnL (match Tab1) ---
+    E_base = cum_risk.reindex(base_index).reindex(columns=pnl_by_factor.columns).fillna(0.0)
+    driver_series = mkt_change[dtype].reindex(base_index).fillna(0.0)
+    pnl_base  = (E_base.shift(1).mul(driver_series, axis=0)).sum(axis=1).rename("PnL_baseline")
+
+    # --- AFTER-HEDGE PnL (positions persistent from T) ---
+    H_aligned = H.reindex(base_index, fill_value=0.0)
+    E_tot     = (E_base.add(H_aligned, fill_value=0.0)).shift(1)  # same lag as baseline
+    pnl_after = (E_tot.mul(driver_series, axis=0)).sum(axis=1).sub(cost_series, fill_value=0.0).rename("PnL_after")
+
+    cum_base  = pnl_base.cumsum().rename("Cum_Base")
+    cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+    figF, axF = plt.subplots(figsize=(12,5), dpi=120)
+    axF.plot(cum_base.index,  cum_base.values,  label="Cumul Base (exposition portée)")
+    axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé (overlay DV01/FX01)")
+    auto_xticks(axF, cum_after.index); format_yaxis_plain(axF)
+    axF.set_title("Cumulative PnL — Base vs Hedgé (positions persistantes)")
+    axF.legend(loc='upper left')
+    st.pyplot(figF)
+
+    k1, k2, k3 = st.columns(3)
+    with k1: st.metric("Δ Cumul (Hedgé - Base)", f"{float(cum_after.iloc[-1]-cum_base.iloc[-1]):,.0f}")
+    with k2: st.metric("Coût total hedge (T-only)", f"{float(cost_series.sum()):,.0f}")
+    with k3:
+        if mode_signal.startswith("Global"):
+            pct_days = 100.0*float((p_stress_series.apply(lambda p: 0.0 if p < tau1 else 1.0)).mean())
+        else:
+            pct_days = 100.0*float((alpha_df.max(axis=1)>0).mean())
+        st.metric("% jours couverts", f"{pct_days:.1f}%")
+
+    st.subheader("Plan de hedge (détaillé)")
+    if plan_df.empty:
+        st.info("Aucun hedge déclenché (seuils non atteints).")
+    else:
+        st.dataframe(
+            plan_df.sort_values(["Date","Constituant_target","Proxy"])\
+                   .style.format({
+                       "alpha":"{:.2f}",
+                       "Risk_target":"{:.0f}",
+                       "Gamma":"{:.3f}",
+                       "HedgeUnits":"{:,.0f}",
+                       "UnitCost":"{:,.3f}",
+                       "CostAlloc":"{:,.0f}"
+                   }).applymap(lambda v: 'color:red;' if isinstance(v,(int,float)) and v<0 else '',
+                               subset=['Risk_target','HedgeUnits','CostAlloc']),
+            use_container_width=True, height=420
+        )
