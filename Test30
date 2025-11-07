@@ -1,0 +1,86 @@
+# =========================
+# MODE SIGNAL — sélection + calcul des α
+# Remplacez votre bloc "Choix du signal … / Détection → α" par ceci
+# =========================
+
+# --- Sélecteur de mode (intègre les 3 variantes Global) ---
+s1, s2 = st.columns([2,1])
+with s1:
+    mode_signal = st.selectbox(
+        "Mode signal / déclenchement",
+        [
+            "Global — p_stress (seuils τ)",
+            "Global — changement de régime (tous)",
+            "Global — entrée en stress",
+            "Par constituant — Jump (|Δcontrib|/MAD)",
+            "Par constituant — Vol (σ roulante)"
+        ],
+        index=0, key="tab3_signal_mode"
+    )
+with s2:
+    win_sig = st.slider("Fenêtre rolling (jours) signal par constituant", 5, 60, 20, 1, key="tab3_win_sig")
+
+# --- Pré-calc communs ---
+eps = 1e-12
+p_stress_series = hmm_proba_stress.reindex(pnl_by_factor.index).ffill().rename("p_stress")
+
+diff_abs = pnl_by_factor.diff().abs()
+med_rolling = pnl_by_factor.rolling(win_sig, min_periods=max(5, win_sig//2)).median()
+mad_rolling = (pnl_by_factor - med_rolling).abs().rolling(win_sig, min_periods=max(5, win_sig//2)).median()
+sig_jump_df = (diff_abs / (mad_rolling + eps))
+sig_jump_df = sig_jump_df.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+std_roll = pnl_by_factor.rolling(win_sig, min_periods=max(5, win_sig//2)).std()
+sig_vol_df = std_roll.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+
+def map_to_alpha(series_like: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=series_like.index, columns=series_like.columns, dtype=float)
+    out[series_like <  tau1] = 0.0
+    out[(series_like >= tau1) & (series_like <  tau2)] = 0.3
+    out[(series_like >= tau2) & (series_like <  tau3)] = 0.6
+    out[series_like >= tau3] = 1.0
+    return out
+
+alpha_global, alpha_df = None, None
+
+# --- LOGIQUES PAR MODE ---
+if mode_signal == "Global — p_stress (seuils τ)":
+    # α_t = {0, 0.3, 0.6, 1.0} selon p_stress et (τ1,τ2,τ3)
+    alpha_global = p_stress_series.apply(
+        lambda p: 0.0 if not np.isfinite(p) else (0.0 if p < tau1 else (0.3 if p < tau2 else (0.6 if p < tau3 else 1.0)))
+    )
+
+elif mode_signal in ["Global — changement de régime (tous)", "Global — entrée en stress"]:
+    # UI spécifique aux modes changement de régime
+    g1, g2 = st.columns(2)
+    with g1:
+        alpha_on_change = st.slider("α appliqué aux dates de changement", 0.0, 1.0, 1.0, 0.1, key="tab3_alpha_on_change")
+    with g2:
+        cooldown_days = st.number_input("Cooldown (jours) entre 2 déclenchements", 0, 30, 0, 1, key="tab3_cooldown")
+
+    # Détection des changements de régime
+    states_on_t = states.reindex(pnl_by_factor.index)
+    if mode_signal == "Global — changement de régime (tous)":
+        trig_mask = states_on_t.ne(states_on_t.shift(1)).fillna(False)
+    else:  # "Global — entrée en stress"
+        trig_mask = (states_on_t == stress_regime) & (states_on_t.shift(1) != stress_regime)
+
+    # Cooldown anti-micro-switching
+    if int(cooldown_days) > 0:
+        trig_mask = trig_mask.copy()
+        last_trig = None
+        for d in trig_mask.index:
+            if bool(trig_mask.loc[d]):
+                if last_trig is None or (d - last_trig).days > int(cooldown_days):
+                    last_trig = d
+                else:
+                    trig_mask.loc[d] = False
+
+    # α_t = α_on_change aux dates de trigger, 0 sinon
+    alpha_global = pd.Series(0.0, index=pnl_by_factor.index, dtype=float)
+    alpha_global.loc[trig_mask[trig_mask].index] = float(alpha_on_change)
+
+elif mode_signal == "Par constituant — Jump (|Δcontrib|/MAD)":
+    alpha_df = map_to_alpha(sig_jump_df.reindex(pnl_by_factor.index).fillna(0.0))
+
+else:  # "Par constituant — Vol (σ roulante)"
+    alpha_df = map_to_alpha(sig_vol_df.reindex(pnl_by_factor.index).fillna(0.0))
