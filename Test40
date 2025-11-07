@@ -1,0 +1,82 @@
+# === Corrélation/β uniquement si XHEDGE vers un FX ===
+from functools import lru_cache
+
+dv01fx_win = st.slider("Fenêtre corr (jours) pour β (FX only)", 20, 180, 60, 5, key="dv01fx_win_simple")
+
+@lru_cache(maxsize=2048)
+def _beta_fx_pair(rate_col: str, fx_col: str, end_date_str: str, win: int) -> tuple[float, float]:
+    """
+    Calcule β = ρ * (σ_r / σ_fx) (toutes en décimal) sur [end-win+1, end],
+    avec Δtaux pris en bp (converti en décimal) et ΔFX en % (converti en décimal).
+    Renvoie (rho, beta). Cache par (rate_col, fx_col, end_date_str, win).
+    """
+    end_date = pd.to_datetime(end_date_str)
+    start = end_date - pd.Timedelta(days=win-1)
+    idx = mkt_change.index[(mkt_change.index >= start) & (mkt_change.index <= end_date)]
+    if len(idx) < max(10, win//2):  # pas assez d'observations propres
+        return (np.nan, np.nan)
+
+    if rate_col not in mkt_change.columns or fx_col not in mkt_change.columns:
+        return (np.nan, np.nan)
+
+    r = (mkt_change.loc[idx, rate_col]).astype(float) * 1e-4   # bp -> décimal
+    f = (mkt_change.loc[idx, fx_col]).astype(float) * 1e-2     # %  -> décimal
+    pair = pd.concat([r.rename("r"), f.rename("fx")], axis=1).dropna()
+    if len(pair) < max(10, win//2) or pair["r"].std() == 0 or pair["fx"].std() == 0:
+        return (np.nan, np.nan)
+
+    rho = float(pair["r"].corr(pair["fx"]))
+    beta = float(rho * (pair["r"].std() / pair["fx"].std()))
+    return (rho, beta)
+
+
+
+# ... à l'intérieur de: for d in pnl_df.index:  puis for c_target in top_names:
+risk_c = float(risk_ts_loc.loc[d, c_target]) if (c_target in risk_ts_loc.columns and d in risk_ts_loc.index) else np.nan
+used_proxy = c_target
+gamma = 1.0
+
+# (ta logique existante pour choisir un proxy via corr régression Δmarché)
+# ...
+
+bucket = _bucket(used_proxy)
+unit_cost = (cost_rate if bucket=='Rates' else (cost_xccy if bucket=='XCCY' else cost_fx))
+
+# === NE CALCULER ρ/β QUE SI XHEDGE VERS UN FX ===
+extra = {"Rho": np.nan, "Beta": np.nan, "FX01_equiv": np.nan}
+is_xhedge_fx = (used_proxy != c_target) and (bucket == 'FX')
+
+if is_xhedge_fx and np.isfinite(risk_c):
+    rho, beta = _beta_fx_pair(rate_col=c_target, fx_col=used_proxy,
+                              end_date_str=str(pd.to_datetime(d).date()), win=int(dv01fx_win))
+    if np.isfinite(beta):
+        fx01_equiv = risk_c * beta * 100.0   # DV01(par bp) -> FX01 par +1% FX
+        hedge_units = - a_j * fx01_equiv
+        extra.update({"Rho": rho, "Beta": beta, "FX01_equiv": fx01_equiv})
+    else:
+        # fallback: sizing marché existant
+        hedge_units = (- a_j * gamma * risk_c)
+else:
+    # cas non-FX ou pas XHEDGE (AUTO): logique existante
+    hedge_units = (- a_j * gamma * risk_c) if np.isfinite(risk_c) else np.nan
+
+plan_rows.append({
+    "Date": d, "CostDate": d,
+    "Mode": ("XHEDGE-1" if used_proxy != c_target else "AUTO"),
+    "Constituant_target": c_target, "alpha": a_j,
+    "Risk_target": risk_c, "Proxy": used_proxy, "Gamma": float(gamma),
+    "HedgeUnits": hedge_units, "Bucket": bucket, "UnitCost": unit_cost,
+    "CostAlloc": (abs(hedge_units)*unit_cost) if np.isfinite(hedge_units) else 0.0,
+    **extra
+})
+
+fmt_cols = {
+    "alpha":"{:.2f}", "Risk_target":"{:.0f}", "Gamma":"{:.3f}",
+    "HedgeUnits":"{:,.0f}", "UnitCost":"{:,.3f}", "CostAlloc":"{:,.0f}",
+    "Rho":"{:.3f}", "Beta":"{:.3f}", "FX01_equiv":"{:,.0f}"
+}
+st.dataframe(
+    plan_df.sort_values(["Date","Constituant_target","Proxy"])\
+           .style.format(fmt_cols),
+    use_container_width=True, height=420
+)
