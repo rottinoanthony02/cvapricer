@@ -1,0 +1,370 @@
+# ============================================================
+# TAB 3 — FULL PARALLEL + DISK CACHE + DV01(dtype→target) + FX01 + CROSS-HEDGE
+# ============================================================
+
+with tab3:
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.linear_model import LinearRegression
+    from joblib import Parallel, delayed, Memory
+    import multiprocessing
+    import os
+
+    # --------------------------------------------------------
+    # DISK CACHE
+    # --------------------------------------------------------
+    CACHE_DIR = "tab3_cache"
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    memory = Memory(location=CACHE_DIR, verbose=0)
+
+    if st.button("🧹 Reset cache Tab 3"):
+        memory.clear(warn=False)
+        st.success("Cache Tab3 effacé.")
+
+    # CPU
+    N_JOBS = max(2, multiprocessing.cpu_count() - 1)
+
+    # --------------------------------------------------------
+    # UI
+    # --------------------------------------------------------
+    st.subheader("HMM • DV01(dtype→target) • Cross-Hedge FX/Rates • Parallelized + Disk Cache")
+
+    c1, c2, c3, c4 = st.columns(4)
+    hmm_states = c1.slider("Nb régimes", 2, 6, 3)
+    n_iter = c2.number_input("n_iter", 50, 2000, 300)
+    topN = c3.slider("Top N facteurs/jour", 1, 20, 5)
+    apply_day = c4.selectbox("Appliquer hedge", ["Jour T", "Jour T+1"])
+
+    d1, d2, d3 = st.columns(3)
+    tau1 = d1.slider("τ1 = α0.3", 0.0, 1.0, 0.50)
+    tau2 = d2.slider("τ2 = α0.6", 0.0, 1.0, 0.70)
+    tau3 = d3.slider("τ3 = α1.0", 0.0, 1.0, 0.85)
+
+    e1, e2, e3 = st.columns(3)
+    cost_rate = e1.number_input("Coût Rates", 0.0, 5.0, 0.20)
+    cost_xccy = e2.number_input("Coût XCCY", 0.0, 5.0, 0.25)
+    cost_fx = e3.number_input("Coût FX", 0.0, 5.0, 0.00)
+
+    s1, s2 = st.columns([2,1])
+    mode_signal = s1.selectbox(
+        "Signal",
+        ["Global (p_stress)", "Par constituant — Jump", "Par constituant — Vol", "Changement de régime"]
+    )
+    win_sig = s2.slider("Fenêtre signal", 5, 60, 20)
+
+    x1, x2, x3 = st.columns(3)
+    use_cross = x1.checkbox("Cross-Hedge marché", True)
+    win_corr = x2.slider("Fenêtre corr", 20, 180, 60)
+    min_abs_corr = x3.slider("Seuil |corr| min", 0.0, 1.0, 0.40)
+
+    dv01fx_win = st.slider("Fenêtre β FX", 20, 180, 60)
+    win_beta_dtype = st.slider("Fenêtre β(dtype→target)", 20, 180, 60)
+
+    base_index = pnl_by_factor.index
+    factors = list(pnl_by_factor.columns)
+
+    # --------------------------------------------------------
+    # 1) HMM
+    # --------------------------------------------------------
+    X_df = pnl_by_factor.replace([np.inf, -np.inf], np.nan).dropna()
+    scaler = StandardScaler()
+    X_use = scaler.fit_transform(X_df)
+
+    hmm = GaussianHMM(hmm_states, "full", n_iter=int(n_iter), random_state=42)
+    hmm.fit(X_use)
+
+    states = pd.Series(hmm.predict(X_use), index=X_df.index)
+    post = pd.DataFrame(
+        hmm.predict_proba(X_use),
+        index=X_df.index,
+        columns=[f"State {i}" for i in range(hmm_states)]
+    )
+
+    means = pd.concat([net_daily.loc[X_df.index], states],axis=1).groupby(1)[0].mean()
+    stress_regime = int(means.idxmin())
+    p_stress = post[f"State {stress_regime}"].reindex(base_index).ffill()
+
+    # Graph HMM
+    figR, axR = plt.subplots(figsize=(12,4))
+    axR.plot(net_daily.index, net_daily.values, lw=1)
+    cmap = plt.colormaps["tab10"]
+    for s in range(hmm_states):
+        mask = (states == s).reindex(net_daily.index).fillna(False)
+        axR.fill_between(net_daily.index, net_daily.values, 0, where=mask, color=cmap(s), alpha=0.12)
+    st.pyplot(figR)
+
+    # --------------------------------------------------------
+    # 2) Signals → α
+    # --------------------------------------------------------
+    eps = 1e-12
+    diff_abs = pnl_by_factor.diff().abs()
+    med_roll = pnl_by_factor.rolling(win_sig).median()
+    mad_roll = (pnl_by_factor - med_roll).abs().rolling(win_sig).median()
+
+    sig_jump = (diff_abs / (mad_roll + eps)).apply(lambda s:(s-s.min())/(s.max()-s.min()+eps))
+    std_roll = pnl_by_factor.rolling(win_sig).std()
+    sig_vol = std_roll.apply(lambda s:(s-s.min())/(s.max()-s.min()+eps))
+
+    def alpha_map(df):
+        out = pd.DataFrame(index=df.index, columns=df.columns)
+        out[df<tau1] = 0.0
+        out[(df>=tau1)&(df<tau2)] = 0.3
+        out[(df>=tau2)&(df<tau3)] = 0.6
+        out[df>=tau3] = 1.0
+        return out
+
+    if mode_signal == "Global (p_stress)":
+        alpha_global = p_stress.apply(lambda p: 0 if p<tau1 else (0.3 if p<tau2 else (0.6 if p<tau3 else 1.0)))
+        alpha_df = None
+    elif mode_signal == "Par constituant — Jump":
+        alpha_df = alpha_map(sig_jump)
+        alpha_global = None
+    elif mode_signal == "Par constituant — Vol":
+        alpha_df = alpha_map(sig_vol)
+        alpha_global = None
+    else:
+        reg_change = states.reindex(base_index).ne(states.reindex(base_index).shift(1)).fillna(False)
+        alpha_global = reg_change.astype(float)
+        alpha_df = None
+
+    # --------------------------------------------------------
+    # 3) Cached + parallel β(dtype→target)
+    # --------------------------------------------------------
+    @memory.cache(ignore=["win"])
+    def compute_beta_dtype_cached(target_col, date_value, win):
+        if dtype not in mkt_change.columns or target_col not in mkt_change.columns:
+            return np.nan
+        end = pd.to_datetime(date_value)
+        start = end - pd.Timedelta(days=win-1)
+        idx = mkt_change.index[(mkt_change.index>=start)&(mkt_change.index<=end)]
+        if len(idx)<10:
+            return np.nan
+        x = mkt_change.loc[idx, dtype]
+        y = mkt_change.loc[idx, target_col]
+        dfxy = pd.concat([x.rename("x"),y.rename("y")],axis=1).dropna()
+        if len(dfxy)<10 or dfxy["x"].var()==0:
+            return np.nan
+        return float(dfxy.cov().loc["x","y"] / dfxy["x"].var())
+
+    grid_dtype = [(d,c) for d in base_index for c in factors]
+
+    beta_dtype_vals = Parallel(n_jobs=N_JOBS)(
+        delayed(compute_beta_dtype_cached)(c, d, win_beta_dtype)
+        for (d,c) in grid_dtype
+    )
+
+    beta_dtype_df = pd.DataFrame(
+        beta_dtype_vals,
+        index=pd.MultiIndex.from_tuples(grid_dtype),
+        columns=["beta_dtype"]
+    ).unstack(level=1)["beta_dtype"]
+
+    # --------------------------------------------------------
+    # 4) Cached + parallel proxy selection
+    # --------------------------------------------------------
+    @memory.cache(ignore=["win_corr"])
+    def compute_best_proxy_cached(date_value, target_col, win_corr):
+        if "XCCY" not in target_col.upper():
+            return (target_col, 1.0)
+
+        end = pd.to_datetime(date_value)
+        start = end - pd.Timedelta(days=win_corr-1)
+        idx = base_index[(base_index>=start)&(base_index<=end)]
+        win = mkt_change.reindex(idx).reindex(columns=factors).dropna()
+
+        if win.empty or target_col not in win.columns:
+            return (target_col, 1.0)
+
+        y = win[target_col]
+        Xc = win.drop(columns=[target_col])
+
+        corr = Xc.corrwith(y).abs().sort_values(ascending=False)
+        corr = corr[[j for j in corr.index if ("FX" in j.upper() or "RATE" in j.upper())]]
+        corr = corr[corr>=min_abs_corr]
+
+        if corr.empty:
+            return (target_col, 1.0)
+
+        best = corr.index[0]
+        reg = LinearRegression(fit_intercept=False)
+        reg.fit(Xc[[best]], y)
+        gamma = float(reg.coef_[0])
+        return (best, gamma)
+
+    grid_proxy = [(d,c) for d in base_index for c in factors]
+
+    proxy_vals = Parallel(n_jobs=N_JOBS)(
+        delayed(compute_best_proxy_cached)(d, c, win_corr)
+        for (d,c) in grid_proxy
+    )
+
+    proxy_df = pd.DataFrame(proxy_vals, index=pd.MultiIndex.from_tuples(grid_proxy), columns=["proxy","gamma"])
+    proxy_proxy = proxy_df["proxy"].unstack()
+    proxy_gamma = proxy_df["gamma"].unstack()
+
+    # --------------------------------------------------------
+    # 5) Cached + parallel FX beta
+    # --------------------------------------------------------
+    @memory.cache(ignore=["win"])
+    def compute_fx_beta_cached(rate_col, fx_col, date_value, win):
+        if rate_col not in mkt_change.columns or fx_col not in mkt_change.columns:
+            return (np.nan, np.nan)
+        end = pd.to_datetime(date_value)
+        start = end - pd.Timedelta(days=win-1)
+        idx = mkt_change.index[(mkt_change.index>=start)&(mkt_change.index<=end)]
+        if len(idx)<10:
+            return (np.nan, np.nan)
+        r = mkt_change.loc[idx, rate_col] * 1e-4
+        f = mkt_change.loc[idx, fx_col] * 1e-2
+        df = pd.concat([r.rename("r"),f.rename("fx")],axis=1).dropna()
+        if len(df)<10 or df["r"].std()==0 or df["fx"].std()==0:
+            return (np.nan, np.nan)
+        rho = df["r"].corr(df["fx"])
+        beta = rho*(df["r"].std()/df["fx"].std())
+        return (rho, beta)
+
+    grid_fx = [(d,c,fx) for d in base_index for c in factors for fx in FX_COLS]
+
+    fx_vals = Parallel(n_jobs=N_JOBS)(
+        delayed(compute_fx_beta_cached)(c, fx, d, dv01fx_win)
+        for (d,c,fx) in grid_fx
+    )
+
+    fx_df = pd.DataFrame(fx_vals, index=pd.MultiIndex.from_tuples(grid_fx), columns=["rho_fx","beta_fx"])
+
+    # --------------------------------------------------------
+    # 6) Hedge plan
+    # --------------------------------------------------------
+    plan_rows = []
+    risk_base = risk_ts.reindex(base_index).reindex(columns=factors).fillna(0.0)
+
+    for d in base_index:
+
+        if alpha_df is not None:
+            alpha_row = alpha_df.loc[d]
+        else:
+            alpha_row = pd.Series(alpha_global.loc[d], index=factors)
+
+        dv01_dtype = risk_base.loc[d, dtype]
+
+        for c_target in factors:
+            a_j = float(alpha_row.get(c_target, 0.0))
+            if a_j <= 0:
+                continue
+
+            # DV01(dtype→target)
+            beta_dt = beta_dtype_df.loc[d, c_target]
+            if np.isfinite(dv01_dtype) and np.isfinite(beta_dt):
+                risk_equiv = dv01_dtype * beta_dt
+            else:
+                risk_equiv = risk_base.loc[d, c_target]
+
+            used_proxy = proxy_proxy.loc[d, c_target]
+            gamma = proxy_gamma.loc[d, c_target]
+
+            bucket = "FX" if used_proxy in FX_COLS else ("XCCY" if "XCCY" in c_target.upper() else "Rates")
+            unit_cost = cost_fx if bucket=="FX" else (cost_xccy if bucket=="XCCY" else cost_rate)
+
+            is_fx = (used_proxy != c_target) and (used_proxy in FX_COLS)
+
+            if is_fx:
+                rho_fx, beta_fx = fx_df.loc[(d, c_target, used_proxy)]
+                if np.isfinite(beta_fx):
+                    fx01 = risk_equiv * beta_fx * 100
+                    hedge_units = -a_j * fx01
+                    FXEQ = fx01
+                else:
+                    hedge_units = -a_j * risk_equiv * gamma
+                    FXEQ = np.nan
+            else:
+                rho_fx, beta_fx, FXEQ = np.nan, np.nan, np.nan
+                hedge_units = -a_j * risk_equiv
+
+            target_day_val = d if apply_day=="Jour T" else d + pd.Timedelta(days=1)
+
+            plan_rows.append({
+                "Date": target_day_val,
+                "CostDate": d,
+                "Constituant_target": c_target,
+                "alpha": a_j,
+                "DV01_equiv": risk_equiv,
+                "Proxy": used_proxy,
+                "Gamma": gamma,
+                "Beta_dtype": beta_dt,
+                "Rho_fx": rho_fx,
+                "Beta_fx": beta_fx,
+                "FX01_equiv": FXEQ,
+                "HedgeUnits": hedge_units,
+                "UnitCost": unit_cost,
+                "CostAlloc": abs(hedge_units)*unit_cost
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    # --------------------------------------------------------
+    # 7) Positions persistantes
+    # --------------------------------------------------------
+    if plan_df.empty:
+        cost_series = pd.Series(0.0,index=base_index)
+        H = pd.DataFrame(0.0,index=base_index,columns=factors)
+    else:
+        cost_series = plan_df.groupby("CostDate")["CostAlloc"].sum().reindex(base_index).fillna(0.0)
+        hedge_delta = plan_df.groupby(["Date","Proxy"])["HedgeUnits"].sum().unstack(fill_value=0)
+        hedge_delta = hedge_delta.reindex(base_index).reindex(columns=factors, fill_value=0)
+        H = hedge_delta.cumsum()
+
+    # --------------------------------------------------------
+    # 8) PnL
+    # --------------------------------------------------------
+    driver_df = mkt_change.reindex(base_index).reindex(columns=factors).fillna(0.0)
+    pnl_base = (risk_base.shift(1)*driver_df).sum(axis=1)
+    pnl_after = ((risk_base+H).shift(1)*driver_df).sum(axis=1) - cost_series
+
+    cum_base = pnl_base.cumsum()
+    cum_after = pnl_after.cumsum()
+
+    # Graph
+    figF, axF = plt.subplots(figsize=(12,5))
+    axF.plot(cum_base.index, cum_base.values, label="Base")
+    axF.plot(cum_after.index, cum_after.values, label="Hedgé")
+    axF.legend()
+    st.pyplot(figF)
+
+    # --------------------------------------------------------
+    # 9) Metrics
+    # --------------------------------------------------------
+    k1,k2,k3 = st.columns(3)
+    k1.metric("Δ Cumul", f"{cum_after.iloc[-1]-cum_base.iloc[-1]:,.0f}")
+    k2.metric("Coût", f"{cost_series.sum():,.0f}")
+    pct = 100*((alpha_df.max(axis=1)>0).mean() if alpha_df is not None else (alpha_global>0).mean())
+    k3.metric("% hedgé", f"{pct:.1f}%")
+
+    # --------------------------------------------------------
+    # 10) Table plan
+    # --------------------------------------------------------
+    st.subheader("Plan de Hedge (Parallel + Disk Cache)")
+
+    if plan_df.empty:
+        st.info("Aucun hedge déclenché.")
+    else:
+        fmt = {
+            "alpha":"{:.2f}",
+            "DV01_equiv":"{:,.0f}",
+            "Gamma":"{:.3f}",
+            "Beta_dtype":"{:.3f}",
+            "Rho_fx":"{:.3f}",
+            "Beta_fx":"{:.3f}",
+            "FX01_equiv":"{:,.0f}",
+            "HedgeUnits":"{:,.0f}",
+            "UnitCost":"{:.3f}",
+            "CostAlloc":"{:,.0f}",
+        }
+        st.dataframe(
+            plan_df.sort_values(["Date","Constituant_target"]).style.format(fmt),
+            use_container_width=True,
+            height=420
+        )
