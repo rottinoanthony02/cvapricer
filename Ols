@@ -1,0 +1,35 @@
+            # X, Y en 1D (Series ou array)
+            X = dfb[c_target].astype(float).squeeze()
+            Y = dfb[dtype].astype(float).squeeze()
+
+            # sécurité : si X est DataFrame (colonnes dupliquées), on prend la 1ère col
+            if isinstance(X, pd.DataFrame):
+                X = X.iloc[:, 0]
+            if isinstance(Y, pd.DataFrame):
+                Y = Y.iloc[:, 0]
+
+            X = pd.to_numeric(X, errors="coerce")
+            Y = pd.to_numeric(Y, errors="coerce")
+            mask = X.notna() & Y.notna()
+            X = X[mask]
+            Y = Y[mask]
+
+            if len(X) < max(30, int(b1)//2):
+                continue
+
+            # pas de variance sur le constituant => pas de beta
+            if np.allclose(X.values, X.values[0]):
+                continue
+
+            # OLS équivalent : beta = Cov(X,Y)/Var(X)
+            Xc = X - X.mean()
+            Yc = Y - Y.mean()
+            cov_xy = (Xc * Yc).mean()
+            var_x  = (Xc ** 2).mean()
+
+            if not np.isfinite(cov_xy) or not np.isfinite(var_x) or var_x == 0.0:
+                continue
+
+            beta_val = float(cov_xy / var_x)
+            if not np.isfinite(beta_val) or beta_val == 0.0:
+                continue
