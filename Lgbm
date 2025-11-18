@@ -1,0 +1,188 @@
+# ===========================================================
+# MODE 1 — Hedge Dynamique XGBoost (sliding window)
+# ===========================================================
+
+with tab4:
+    st.subheader("Mode 1 — Hedge dynamique XGBoost (T+1)")
+
+    try:
+        from xgboost import XGBRegressor
+    except ImportError:
+        st.error("xgboost n'est pas installé (pip install xgboost)")
+    else:
+
+        # --------------------------
+        # PARAMÈTRES UTILISATEUR
+        # --------------------------
+        win_feat = st.slider("Fenêtre vol/jump (jours)", 10, 120, 30, 5,
+                             key="tab4_dyn_winfeat")
+        min_obs  = st.slider("Min observations par constituant", 100, 300, 150, 10,
+                             key="tab4_dyn_minobs")
+        n_estim  = st.slider("Nombre d'arbres XGBoost", 100, 800, 300, 50,
+                             key="tab4_dyn_nestimators")
+        max_depth = st.slider("Profondeur max", 2, 8, 3, 1,
+                              key="tab4_dyn_depth")
+
+        # Récupération des dates et facteurs
+        base_index = pnl_by_factor.index
+        factors    = list(pnl_by_factor.columns)
+
+        # DV01 ts (déjà aligné Tab3)
+        dv01_df = risk_ts.reindex(base_index).reindex(columns=factors)
+
+        # marché / drivers déjà alignés
+        mkt_df = mkt_change.reindex(base_index)
+
+        plan_rows = []
+
+        # ===========================================================
+        #   LOOP JOUR PAR JOUR (sliding XGB)
+        # ===========================================================
+        for d in range(len(base_index)-1):  # hedge appliqué à T+1
+            t = base_index[d]
+            t1 = base_index[d+1]
+
+            # alpha basé sur p_stress
+            pst = float(p_stress.loc[t]) if t in p_stress.index else 0.0
+            if pst < tau1:
+                alpha_t1 = 0.0
+            elif pst < tau2:
+                alpha_t1 = 0.3
+            elif pst < tau3:
+                alpha_t1 = 0.6
+            else:
+                alpha_t1 = 1.0
+
+            # --------------------------
+            # TRAIN XGBoost DV01_pred pour chaque constituant
+            # --------------------------
+            for c in factors:
+
+                # features
+                feat = pd.DataFrame(index=base_index)
+                feat["vol"]  = pnl_by_factor[c].rolling(win_feat).std().shift(1)
+                feat["jump"] = pnl_by_factor[c].diff().abs().shift(1)
+                feat["p_stress"] = p_stress.shift(1)
+                feat["move_dtype"] = mkt_df[dtype].shift(1)
+
+                target = dv01_df[c].shift(-1)
+
+                dfc = pd.concat([feat, target.rename("target")], axis=1).dropna()
+
+                # pas assez d'historique
+                if len(dfc) < min_obs:
+                    continue
+
+                # Séparer train = dates < t
+                df_train = dfc.loc[dfc.index < t]
+                if len(df_train) < min_obs:
+                    continue
+
+                X_train = df_train[feat.columns].values
+                y_train = df_train["target"].values
+
+                # Prédiction pour t+1
+                X_pred = dfc.loc[[t]].drop(columns="target", errors="ignore")
+                if X_pred.isna().any().any():
+                    continue
+                X_pred = X_pred.values
+
+                # Modèle XGB
+                model = XGBRegressor(
+                    n_estimators=n_estim,
+                    max_depth=max_depth,
+                    learning_rate=0.05,
+                    subsample=0.8,
+                    colsample_bytree=0.8,
+                    objective="reg:squarederror",
+                    random_state=42
+                )
+                model.fit(X_train, y_train)
+
+                dv01_pred = float(model.predict(X_pred)[0])
+                dv01_pred = 0.0 if not np.isfinite(dv01_pred) else dv01_pred
+
+                # HedgeUnits = -alpha * DV01_pred
+                hedge_units = - alpha_t1 * dv01_pred
+
+                # bucket / coût
+                u = str(c).upper()
+                if "FX" in u or ("FX_COLS" in globals() and c in FX_COLS):
+                    bucket = "FX"
+                    unit_cost = cost_fx
+                elif "XCCY" in u or "BASIS" in u:
+                    bucket = "XCCY"
+                    unit_cost = cost_xccy
+                else:
+                    bucket = "Rates"
+                    unit_cost = cost_rate
+
+                plan_rows.append({
+                    "Date_signal": t,
+                    "Date_apply": t1,
+                    "Constituant": c,
+                    "DV01_pred": dv01_pred,
+                    "Alpha": alpha_t1,
+                    "HedgeUnits": hedge_units,
+                    "Bucket": bucket,
+                    "UnitCost": unit_cost,
+                    "CostAlloc": abs(hedge_units) * unit_cost
+                })
+
+        # ===========================================================
+        #   SYNTHÈSE PLAN DYNAMIQUE XGBoost
+        # ===========================================================
+        plan_df_xgb_dyn = pd.DataFrame(plan_rows)
+
+        st.markdown("### Plan XGBoost dynamique (T+1)")
+        st.dataframe(
+            plan_df_xgb_dyn
+                .sort_values(["Date_apply","Constituant"])
+                .style.format({
+                    "DV01_pred": "{:,.0f}",
+                    "Alpha": "{:.1f}",
+                    "HedgeUnits": "{:,.0f}",
+                    "CostAlloc": "{:,.0f}",
+                }),
+            use_container_width=True,
+            height=350
+        )
+
+        # ===========================================================
+        #  PnL DYNAMIQUE (Daily hedge)
+        # ===========================================================
+        st.markdown("### PnL dynamique (XGBoost Hedge)")
+
+        # Baseline PnL (comme Tab1)
+        driver = mkt_df[dtype].fillna(0.0)
+        pnl_base = (dv01_df.shift(1).mul(driver, axis=0)).sum(axis=1)
+
+        # Hedge H(t) = somme over constituants hedgeunits(t)
+        H_dyn = pd.Series(0.0, index=base_index)
+
+        for _, row in plan_df_xgb_dyn.iterrows():
+            c = row["Constituant"]
+            t1 = row["Date_apply"]
+            hu = row["HedgeUnits"]
+            if c in pnl_by_factor.columns and t1 in base_index:
+                H_dyn.loc[t1] += hu * pnl_by_factor.loc[t1, c]
+
+        cost_total = plan_df_xgb_dyn["CostAlloc"].sum()
+
+        pnl_after = pnl_base + H_dyn - cost_total/len(pnl_base)
+
+        cum_base = pnl_base.cumsum()
+        cum_after = pnl_after.cumsum()
+
+        # Plot
+        fig, ax = plt.subplots(figsize=(12,5), dpi=120)
+        ax.plot(cum_base.index, cum_base.values, label="Cumul Base")
+        ax.plot(cum_after.index, cum_after.values, label="Cumul Hedgé (XGB dynamique)")
+        ax.set_title("PnL cumulatif — Base vs XGBoost Hedge Dynamique")
+        ax.legend()
+        st.pyplot(fig)
+
+        # KPIs
+        gain = float(cum_after.iloc[-1] - cum_base.iloc[-1])
+        st.metric("Gain net hedge XGB dynamique", f"{gain:,.0f}")
+        st.metric("Coût total", f"{cost_total:,.0f}")
