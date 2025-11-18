@@ -1,0 +1,418 @@
+# ============== TAB 3 — Bloc A (Paramètres + HMM) ==============
+with tab3:
+
+    st.subheader("Tab 3 — Régimes HMM + α + Hedge DV01/FX")
+
+    # --------------------- PARAMÉTRAGE ------------------------
+    c1, c2, c3, c4 = st.columns(4)
+    hmm_states = c1.slider("Nb régimes (HMM)", 2, 6, 3)
+    n_iter     = c2.number_input("n_iter (EM)", 50, 2000, 300, 50)
+    topN       = c3.slider("Top N constituants / jour", 1, 20, 4)
+    apply_day  = c4.selectbox("Appliquer hedge", ["Jour T", "Jour T+1"], index=0)
+
+    d1, d2, d3 = st.columns(3)
+    tau1 = d1.slider("τ1 (alpha=0)", 0.0, 1.0, 0.50, 0.05)
+    tau2 = d2.slider("τ2 (alpha=0.3)",0.0, 1.0, 0.70, 0.05)
+    tau3 = d3.slider("τ3 (alpha=1.0)",0.0, 1.0, 0.85, 0.05)
+
+    e1, e2, e3 = st.columns(3)
+    cost_rate = e1.number_input("Coût Rates (par DV01)",0.0,5.0,0.20,0.01)
+    cost_xccy = e2.number_input("Coût XCCY (par DV01)",0.0,5.0,0.25,0.01)
+    cost_fx   = e3.number_input("Coût FX (par notionnel)",0.0,5.0,0.00,0.01)
+
+    s1, s2 = st.columns([2,1])
+    mode_signal = s1.selectbox(
+        "Signal de hedge (α)",
+        ["Global (HMM)", "Jump", "Vol"],
+        index=0
+    )
+    win_sig = s2.slider("Fenêtre rolling signal", 5, 60, 20)
+
+    # Sélection du data type à hedger
+    dtype = st.selectbox("Data Type (à hedger)", list(pnl_by_factor.columns))
+
+    # Paramètre fenêtre β
+    b1 = st.slider("Fenêtre β (jours)", 20, 260, 120, 10)
+
+    # ------------------------ HMM ----------------------------
+    X_df = pnl_by_factor.replace([np.inf,-np.inf],np.nan).dropna(how="any")
+    idx_obs = X_df.index
+
+    scaler = StandardScaler()
+    X_use  = scaler.fit_transform(X_df.values)
+
+    hmm = GaussianHMM(
+        n_components=int(hmm_states),
+        covariance_type="full",
+        n_iter=int(n_iter),
+        random_state=42
+    )
+    hmm.fit(X_use)
+
+    states = pd.Series(hmm.predict(X_use), index=idx_obs, name="state")
+    proba  = pd.DataFrame(hmm.predict_proba(X_use),
+                          index=idx_obs)
+
+    net_os = pd.concat([net_daily.reindex(idx_obs), states], axis=1).dropna()
+    means  = net_os.groupby("state")["NetDailyPnL"].mean()
+    stress_regime = int(means.idxmin())
+
+    p_stress = (
+        proba.iloc[:, stress_regime]
+             .rename("p_stress")
+             .reindex(pnl_by_factor.index)
+             .ffill()
+    )
+
+    # ----- Graphs HMM : PnL / p_stress / Régimes -----
+    fig, (ax1, ax2, ax3) = plt.subplots(3,1,figsize=(12,8),dpi=120,sharex=True)
+
+    # PnL
+    ax1.plot(net_daily.index, net_daily.values, lw=1.2)
+    ax1.set_title("PnL quotidien")
+    format_yaxis_plain(ax1)
+
+    # p_stress
+    ax2.plot(p_stress.index, p_stress.values, lw=1.2, label="p_stress")
+    ax2.axhline(tau1, ls="--", lw=0.7)
+    ax2.axhline(tau2, ls="--", lw=0.7)
+    ax2.axhline(tau3, ls="--", lw=0.7)
+    ax2.set_ylim(-0.05,1.05)
+    ax2.set_title("Probabilité régime stress")
+
+    # États HMM
+    states_full = states.reindex(pnl_by_factor.index).ffill()
+    ax3.step(states_full.index, states_full.values, where="post", lw=1.0)
+    ax3.set_yticks(range(int(hmm_states)))
+    ax3.set_title("Régime HMM (discret)")
+    ax3.grid(axis="y", linestyle=":")
+
+    # bandes verticales stress
+    stress_mask = (states_full == stress_regime)
+    idx = states_full.index
+    in_stress=False; start=None
+    for i in range(len(idx)):
+        if stress_mask.iloc[i] and not in_stress:
+            in_stress=True; start=idx[i]
+        elif not stress_mask.iloc[i] and in_stress:
+            ax3.axvspan(start, idx[i], color="red", alpha=0.15)
+            in_stress=False
+    if in_stress:
+        ax3.axvspan(start, idx[-1], color="red", alpha=0.15)
+
+    auto_xticks(ax3, pnl_by_factor.index)
+    plt.tight_layout()
+    st.pyplot(fig)
+  # ============== TAB 3 — Bloc B (Signaux + Alpha) ==============
+
+    # ---------- Construction des signaux par constituant ----------
+    eps = 1e-12
+    pnl_df = pnl_by_factor.reindex(pnl_by_factor.index)
+
+    # --- Jump : |Δcontrib| / MAD rolling ---
+    diff_abs = pnl_df.diff().abs()
+
+    med_roll = pnl_df.rolling(win_sig, min_periods=max(5,win_sig//2)).median()
+    mad_roll = (pnl_df - med_roll).abs().rolling(win_sig, min_periods=max(5,win_sig//2)).median()
+
+    sig_jump = (diff_abs / (mad_roll + eps))
+    sig_jump = sig_jump.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+
+    # --- Vol : rolling std normalisée ---
+    std_roll = pnl_df.rolling(win_sig, min_periods=max(5,win_sig//2)).std()
+    sig_vol  = std_roll.apply(lambda s: (s - s.min()) / (s.max() - s.min() + eps))
+
+    # ---------- Mapping → alpha ----------
+    def map_alpha(series_like: pd.DataFrame) -> pd.DataFrame:
+        out = pd.DataFrame(index=series_like.index, columns=series_like.columns)
+        out[series_like <  tau1] = 0.0
+        out[(series_like >= tau1) & (series_like < tau2)] = 0.3
+        out[(series_like >= tau2) & (series_like < tau3)] = 0.6
+        out[series_like >= tau3] = 1.0
+        return out.astype(float)
+
+    # --- alpha global ou alpha par constituant ---
+    if mode_signal == "Global (HMM)":
+        # alpha global : une seule valeur par jour
+        alpha_global = p_stress.apply(
+            lambda p: 0.0 if p < tau1 else (0.3 if p < tau2 else (0.6 if p < tau3 else 1.0))
+        )
+        alpha_df = None
+
+        # Graph signal global
+        figA, axA = plt.subplots(figsize=(12,3), dpi=120)
+        axA.plot(alpha_global.index, alpha_global.values, lw=1.3)
+        axA.set_title("Alpha global (HMM p_stress → α)")
+        auto_xticks(axA, alpha_global.index)
+        st.pyplot(figA)
+
+    elif mode_signal == "Jump":
+        alpha_df = map_alpha(sig_jump.reindex(pnl_df.index).fillna(0))
+        alpha_global = None
+
+        # Graph heatmap Jump-alpha
+        figJ, axJ = plt.subplots(figsize=(12,5), dpi=120)
+        cax = axJ.imshow(alpha_df.T, aspect="auto", cmap="viridis", interpolation="nearest")
+        axJ.set_title("Alpha par constituant (Jump)")
+        axJ.set_yticks(range(len(alpha_df.columns)))
+        axJ.set_yticklabels(alpha_df.columns)
+        figJ.colorbar(cax, ax=axJ, fraction=0.02)
+        st.pyplot(figJ)
+
+    else:  # Vol
+        alpha_df = map_alpha(sig_vol.reindex(pnl_df.index).fillna(0))
+        alpha_global = None
+
+        figV, axV = plt.subplots(figsize=(12,5), dpi=120)
+        cax = axV.imshow(alpha_df.T, aspect="auto", cmap="plasma", interpolation="nearest")
+        axV.set_title("Alpha par constituant (Vol)")
+        axV.set_yticks(range(len(alpha_df.columns)))
+        axV.set_yticklabels(alpha_df.columns)
+        figV.colorbar(cax, ax=axV, fraction=0.02)
+        st.pyplot(figV)
+# ============== TAB 3 — Bloc C (Hedge Logic DV01 + FX) ==============
+
+    # ----------------------- Préparation ------------------------
+    base_index = pnl_by_factor.index
+    factors    = list(pnl_by_factor.columns)
+
+    pnl_df  = pnl_by_factor.reindex(base_index)
+    risk_df = risk_ts.reindex(base_index).reindex(columns=factors)
+
+    mkt_df  = mkt_change.reindex(base_index)
+
+    # utilitaire bucket
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    plan_rows = []
+    cost_series = pd.Series(0.0, index=base_index)
+
+    # ----------------------- HEDGE LOOP -------------------------
+    for d in base_index:
+
+        # Top N constituants par journée
+        pnl_row = pnl_df.loc[d]
+        top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+        # Alpha du jour
+        if alpha_df is not None:
+            a_row = alpha_df.loc[d].reindex(factors).fillna(0.0)
+        else:
+            a_row = pd.Series(float(alpha_global.get(d,0.0)), index=factors)
+
+        # Date d'application
+        target_day = d if apply_day == "Jour T" else (d + pd.Timedelta(days=1))
+
+        for c_target in top_names:
+
+            alpha_j = float(a_row.get(c_target,0.0))
+            if alpha_j <= 0:
+                continue
+
+            # DV01 du constituant exprimé en DV01(dtype)
+            dv01_const = float(risk_df.loc[d, c_target]) if c_target in risk_df.columns else np.nan
+            if not np.isfinite(dv01_const) or dv01_const == 0.0:
+                continue
+
+            # ---------- Calcul du beta (dtype <- X) ----------
+            if c_target not in mkt_df.columns or dtype not in mkt_df.columns:
+                continue
+
+            dfb = mkt_df[[c_target,dtype]].dropna()
+            dfb = dfb.loc[dfb.index <= d].tail(int(b1))
+
+            if len(dfb) < max(30, int(b1)//2) or dfb[c_target].var() == 0:
+                continue
+
+            X = dfb[c_target]   # move constituant ou FX
+            Y = dfb[dtype]      # move dtype (à hedger)
+            beta = float(np.cov(X,Y,ddof=0)[0,1] / np.var(X))
+
+            if not np.isfinite(beta) or beta == 0:
+                continue
+
+            bucket = _bucket(c_target)
+
+            # =========================
+            #    HEDGE RATES / XCCY
+            # =========================
+            if bucket != "FX":
+                # DV01 dtype
+                hedge_units = - alpha_j * dv01_const / beta
+                used_proxy  = dtype
+
+            # =========================
+            #         HEDGE FX
+            # =========================
+            else:
+                # Notional FX
+                hedge_units = - alpha_j * dv01_const * beta
+                used_proxy  = c_target
+
+            # coût unité
+            unit_cost = (
+                cost_rate if bucket=="Rates"
+                else cost_xccy if bucket=="XCCY"
+                else cost_fx
+            )
+
+            # coût au jour du signal (toujours en T)
+            if d in cost_series.index and np.isfinite(hedge_units):
+                cost_series.loc[d] += abs(hedge_units)*unit_cost
+
+            # enregistre une ligne
+            plan_rows.append({
+                "SignalDate": d,
+                "Date": target_day,
+                "Mode": "BETA",
+                "Constituant_target": c_target,
+                "Proxy": used_proxy,
+                "Bucket": bucket,
+                "alpha": alpha_j,
+                "DV01_const_as_dtype": dv01_const,
+                "Beta(dtype<-X)": beta,
+                "HedgeUnits": hedge_units,
+                "UnitCost": unit_cost,
+                "CostAlloc": abs(hedge_units)*unit_cost
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+# ============== TAB 3 — Bloc D (PnL base vs hedgé) ==============
+
+    # ---------- PnL base (Tab1) ----------
+    base_index = pnl_by_factor.index
+    factors    = list(pnl_by_factor.columns)
+
+    pnl_base = net_daily.reindex(base_index).fillna(0.0).rename("PnL_base")
+
+    # ---------- Drivers de marché ----------
+    drivers = (
+        mkt_change.reindex(base_index)
+                  .reindex(columns=factors)
+                  .fillna(0.0)
+    )
+
+    # ---------- Positions de hedge H(t, factor) ----------
+    if plan_df.empty:
+        H = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        plan_nonempty = plan_df[
+            plan_df["Proxy"].notna() & plan_df["HedgeUnits"].notna()
+        ].copy()
+
+        if plan_nonempty.empty:
+            H = pd.DataFrame(0.0, index=base_index, columns=factors)
+        else:
+            plan_nonempty["Date"] = pd.to_datetime(
+                plan_nonempty["Date"], errors="coerce"
+            )
+
+            hedge_incr = (
+                plan_nonempty.pivot_table(
+                    index="Date",
+                    columns="Proxy",
+                    values="HedgeUnits",
+                    aggfunc="sum",
+                    fill_value=0.0
+                )
+                .reindex(base_index)
+                .reindex(columns=factors, fill_value=0.0)
+            )
+
+            H = hedge_incr.cumsum()
+
+    # ---------- PnL hedge ----------
+    pnl_hedge = (H.shift(1) * drivers).sum(axis=1).rename("PnL_hedge")
+
+    # ---------- Coût de hedge ----------
+    cost_series = cost_series.reindex(base_index).fillna(0.0).rename("HedgeCost")
+
+    # ---------- PnL après hedge ----------
+    pnl_after = (pnl_base + pnl_hedge - cost_series).rename("PnL_after")
+
+    cum_base  = pnl_base.cumsum().rename("Cum_Base")
+    cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+    # ---------- Graph cumulatif ----------
+    figF, axF = plt.subplots(figsize=(12,4), dpi=120)
+    axF.plot(cum_base.index,  cum_base.values,  label="Cumul Base (Tab1)")
+    axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé")
+    auto_xticks(axF, cum_base.index)
+    format_yaxis_plain(axF)
+    axF.set_title("Cumulative PnL — Base vs Hedgé")
+    axF.legend(loc="upper left")
+    st.pyplot(figF)
+
+    # ---------- Métriques ----------
+    k1, k2, k3 = st.columns(3)
+    k1.metric(
+        "Δ Cumul (Hedgé - Base)",
+        f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}"
+    )
+    k2.metric(
+        "Coût total hedge",
+        f"{float(cost_series.sum()):,.0f}"
+    )
+    if mode_signal.startswith("Global"):
+        pct_days = 100.0 * float(
+            (p_stress.apply(lambda p: 0.0 if p < tau1 else 1.0)).mean()
+        )
+    else:
+        pct_days = 100.0 * float(
+            (alpha_df.max(axis=1) > 0).mean()
+        ) if alpha_df is not None else 0.0
+    k3.metric("% jours couverts", f"{pct_days:.1f}%")
+
+    # ---------- Décomposition PnL ----------
+    with st.expander("Décomposition PnL (base / hedge / coût / after)", expanded=False):
+        pnl_decomp = pd.concat(
+            [pnl_base, pnl_hedge, cost_series, pnl_after],
+            axis=1
+        )
+        st.dataframe(
+            pnl_decomp.tail(60).style.format("{:,.0f}"),
+            use_container_width=True,
+            height=320
+        )
+# ============== TAB 3 — Bloc E (Table Plan de hedge) ==============
+
+    st.subheader("Plan de hedge (détaillé)")
+
+    if plan_df.empty:
+        st.info("Aucun hedge déclenché (seuils non atteints).")
+    else:
+        cols_show = [
+            "SignalDate",
+            "Date",
+            "Mode",
+            "Constituant_target",
+            "Proxy",
+            "Bucket",
+            "alpha",
+            "DV01_const_as_dtype",
+            "Beta(dtype<-X)",
+            "HedgeUnits",
+            "UnitCost",
+            "CostAlloc"
+        ]
+        cols_show = [c for c in cols_show if c in plan_df.columns]
+
+        st.dataframe(
+            plan_df.sort_values(["SignalDate","Date","Constituant_target","Proxy"])[cols_show]
+                   .style.format({
+                        "alpha": "{:.2f}",
+                        "DV01_const_as_dtype": "{:,.0f}",
+                        "Beta(dtype<-X)": "{:.3f}",
+                        "HedgeUnits": "{:,.0f}",
+                        "UnitCost": "{:,.3f}",
+                        "CostAlloc": "{:,.0f}",
+                   }),
+            use_container_width=True,
+            height=420
+        )
