@@ -1,0 +1,169 @@
+    # ================= PNL BASE VS HEDGÉ =================
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # --- Sécurité sur plan_df ---
+    if "plan_df" not in locals() or plan_df is None:
+        plan_df = pd.DataFrame()
+
+    base_index = pnl_by_factor.index
+    factors    = list(pnl_by_factor.columns)
+
+    # --- PnL base (doit matcher Tab1) ---
+    pnl_base = net_daily.reindex(base_index)
+    # si net_daily est un DataFrame, prendre la première colonne
+    if isinstance(pnl_base, pd.DataFrame):
+        pnl_base = pnl_base.iloc[:,0]
+    pnl_base = pd.to_numeric(pnl_base, errors="coerce").fillna(0.0)
+    pnl_base.name = "PnL_base"
+
+    # --- Drivers de marché ---
+    drivers = (
+        mkt_change.reindex(base_index)
+                  .reindex(columns=factors)
+    )
+    drivers = drivers.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    # --- Matrice des positions de hedge H(t, facteur) ---
+    if plan_df.empty:
+        H = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        pdf = plan_df.copy()
+        # garde seulement les lignes avec Proxy + HedgeUnits valides
+        pdf = pdf[pdf["Proxy"].notna() & pdf["HedgeUnits"].notna()]
+        if pdf.empty:
+            H = pd.DataFrame(0.0, index=base_index, columns=factors)
+        else:
+            pdf["Date"] = pd.to_datetime(pdf["Date"], errors="coerce")
+            # on agrège par Date x Proxy → HedgeUnits
+            hedge_incr = (
+                pdf.pivot_table(
+                    index="Date",
+                    columns="Proxy",
+                    values="HedgeUnits",
+                    aggfunc="sum",
+                    fill_value=0.0
+                )
+                .reindex(base_index)
+                .reindex(columns=factors, fill_value=0.0)
+            )
+            H = hedge_incr.cumsum()
+
+    # --- PnL hedge (overlay) ---
+    pnl_hedge = (H.shift(1) * drivers).sum(axis=1)
+    pnl_hedge = pd.to_numeric(pnl_hedge, errors="coerce").fillna(0.0)
+    pnl_hedge.name = "PnL_hedge"
+
+    # --- Coût de hedge (reconstruit proprement depuis plan_df) ---
+    if (not plan_df.empty) and ("CostAlloc" in plan_df.columns) and ("SignalDate" in plan_df.columns):
+        cost_series = (
+            plan_df.groupby("SignalDate")["CostAlloc"]
+                   .sum()
+                   .reindex(base_index)
+                   .fillna(0.0)
+        )
+    else:
+        cost_series = pd.Series(0.0, index=base_index)
+    cost_series = pd.to_numeric(cost_series, errors="coerce").fillna(0.0)
+    cost_series.name = "HedgeCost"
+
+    # --- PnL après hedge ---
+    pnl_after = pnl_base + pnl_hedge - cost_series
+    pnl_after = pd.to_numeric(pnl_after, errors="coerce").fillna(0.0)
+    pnl_after.name = "PnL_after"
+
+    # --- Cumul ---
+    cum_base  = pnl_base.cumsum()
+    cum_after = pnl_after.cumsum()
+    cum_base.name  = "Cum_Base"
+    cum_after.name = "Cum_Hedged"
+
+    # si jamais DataFrame, on prend la 1ère colonne
+    if isinstance(cum_base, pd.DataFrame):
+        cum_base = cum_base.iloc[:,0]
+    if isinstance(cum_after, pd.DataFrame):
+        cum_after = cum_after.iloc[:,0]
+
+    cum_base  = pd.to_numeric(cum_base, errors="coerce").fillna(0.0)
+    cum_after = pd.to_numeric(cum_after, errors="coerce").fillna(0.0)
+
+    x_base  = np.asarray(cum_base.index)
+    y_base  = cum_base.to_numpy(dtype=float)
+    x_after = np.asarray(cum_after.index)
+    y_after = cum_after.to_numpy(dtype=float)
+
+    # --- Graph cumulé (sécurisé) ---
+    figF, axF = plt.subplots(figsize=(12,4), dpi=120)
+    axF.plot(x_base,  y_base,  label="Cumul Base (Tab1)")
+    axF.plot(x_after, y_after, label="Cumul Hedgé")
+    auto_xticks(axF, x_base)
+    format_yaxis_plain(axF)
+    axF.set_title("Cumulative PnL — Base vs Hedgé")
+    axF.legend(loc="upper left")
+    st.pyplot(figF)
+
+    # --- Métriques ---
+    k1, k2, k3 = st.columns(3)
+    k1.metric("Δ Cumul (Hedgé - Base)",
+              f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+    k2.metric("Coût total hedge",
+              f"{float(cost_series.sum()):,.0f}")
+    if mode_signal.startswith("Global"):
+        pct_days = 100.0 * float(
+            (p_stress.apply(lambda p: 0.0 if p < tau1 else 1.0)).mean()
+        )
+    else:
+        pct_days = 100.0 * float(
+            (alpha_df.max(axis=1) > 0).mean()
+        ) if alpha_df is not None else 0.0
+    k3.metric("% jours couverts", f"{pct_days:.1f}%")
+
+    # --- Décomposition PnL (debug / analyse) ---
+    with st.expander("Décomposition PnL (base / hedge / coût / after)", expanded=False):
+        pnl_decomp = pd.concat(
+            [pnl_base, pnl_hedge, cost_series, pnl_after],
+            axis=1
+        )
+        st.dataframe(
+            pnl_decomp.tail(60).style.format("{:,.0f}"),
+            use_container_width=True,
+            height=320
+        )
+
+    # --- Table plan de hedge (finale) ---
+    st.subheader("Plan de hedge (détaillé)")
+
+    if plan_df.empty:
+        st.info("Aucun hedge déclenché (seuils non atteints).")
+    else:
+        cols_show = [
+            "SignalDate",
+            "Date",
+            "Mode",
+            "Constituant_target",
+            "Proxy",
+            "Bucket",
+            "alpha",
+            "DV01_const_as_dtype",
+            "Beta(dtype<-X)",
+            "HedgeUnits",
+            "UnitCost",
+            "CostAlloc"
+        ]
+        cols_show = [c for c in cols_show if c in plan_df.columns]
+
+        st.dataframe(
+            plan_df.sort_values(["SignalDate","Date","Constituant_target","Proxy"])[cols_show]
+                   .style.format({
+                        "alpha": "{:.2f}",
+                        "DV01_const_as_dtype": "{:,.0f}",
+                        "Beta(dtype<-X)": "{:.3f}",
+                        "HedgeUnits": "{:,.0f}",
+                        "UnitCost": "{:,.3f}",
+                        "CostAlloc": "{:,.0f}",
+                   }),
+            use_container_width=True,
+            height=420
+        )
