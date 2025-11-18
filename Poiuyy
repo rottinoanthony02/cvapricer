@@ -1,0 +1,99 @@
+    # ============== TAB 3 — Bloc C (Hedge en DV01 du constituant) ==============
+
+    base_index = pnl_by_factor.index
+    factors    = list(pnl_by_factor.columns)
+
+    pnl_df  = pnl_by_factor.reindex(base_index)
+    risk_df = risk_ts.reindex(base_index).reindex(columns=factors)
+    mkt_df  = mkt_change.reindex(base_index)
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    plan_rows = []
+
+    # ----------------------- HEDGE LOOP -------------------------
+    for d in base_index:
+
+        # Top N constituants par journée
+        pnl_row   = pnl_df.loc[d]
+        top_names = pnl_row.abs().sort_values(ascending=False).head(int(topN)).index.tolist()
+
+        # Alpha du jour
+        if alpha_df is not None:
+            a_row = alpha_df.loc[d].reindex(factors).fillna(0.0)
+        else:
+            a_row = pd.Series(float(alpha_global.get(d, 0.0)), index=factors)
+
+        # Date d'application (T ou T+1)
+        target_day = d if apply_day == "Jour T" else (d + pd.Timedelta(days=1))
+
+        for c_target in top_names:
+
+            alpha_j = float(a_row.get(c_target, 0.0))
+            if alpha_j <= 0.0:
+                continue
+
+            # DV01 du constituant, déjà exprimé en unité du data type
+            dv01_const_dtype = float(risk_df.loc[d, c_target]) if c_target in risk_df.columns else np.nan
+            if not np.isfinite(dv01_const_dtype) or dv01_const_dtype == 0.0:
+                continue
+
+            # Besoin du move du constituant ET du dtype pour le beta
+            if (c_target not in mkt_df.columns) or (dtype not in mkt_df.columns):
+                continue
+
+            dfb = mkt_df[[c_target, dtype]].dropna()
+            dfb = dfb.loc[dfb.index <= d].tail(int(b1))
+            if len(dfb) < max(30, int(b1)//2):
+                continue
+
+            X = dfb[c_target].astype(float).to_numpy()  # move constituant
+            Y = dfb[dtype].astype(float).to_numpy()     # move data type
+
+            # pas de variance sur le constituant => pas de beta
+            if np.allclose(X, X[0]):
+                continue
+
+            # OLS officiel : Y = a + beta * X
+            beta_slope, beta_intercept = np.polyfit(X, Y, 1)
+            beta_val = float(beta_slope)
+            if not np.isfinite(beta_val) or beta_val == 0.0:
+                continue
+
+            # DV01 natif du constituant (par unité de move du constituant)
+            dv01_const_native = dv01_const_dtype * beta_val
+
+            # Hedge en DV01 du constituant
+            hedge_units = - alpha_j * dv01_const_native
+            used_proxy  = c_target   # on TRADE le constituant
+
+            bucket = _bucket(c_target)
+            unit_cost = (
+                cost_rate if bucket == "Rates"
+                else cost_xccy if bucket == "XCCY"
+                else cost_fx
+            )
+
+            plan_rows.append({
+                "SignalDate": d,
+                "Date": target_day,
+                "Mode": "DV01_CONSTITUANT",
+                "Constituant_target": c_target,
+                "Proxy": used_proxy,                 # toujours le constituant
+                "Bucket": bucket,
+                "alpha": alpha_j,
+                "DV01_const_as_dtype": dv01_const_dtype,
+                "Beta(dtype<-X)": beta_val,
+                "DV01_const_native": dv01_const_native,
+                "HedgeUnits": hedge_units,          # DV01 du constituant
+                "UnitCost": unit_cost,
+                "CostAlloc": abs(hedge_units) * unit_cost
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
