@@ -1,0 +1,165 @@
+# =========================
+# TAB 5 — Stress Forecast + Hedge Auto
+# =========================
+with tab5:
+    st.subheader("Tab 5 — Stress forecast + hedge auto (HMM)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    base_index = pnl_by_factor.index
+
+    # ---------- Sécurité : s'assurer d'avoir un HMM dispo ----------
+    try:
+        A = hmm.transmat_
+        states_use = states
+        proba_use  = proba
+        stress_reg = stress_regime
+        p_stress_use = p_stress
+    except Exception:
+        from hmmlearn.hmm import GaussianHMM
+        from sklearn.preprocessing import StandardScaler
+
+        X_df = pnl_by_factor.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+        idx_obs = X_df.index
+        scaler = StandardScaler()
+        X_use  = scaler.fit_transform(X_df.values)
+
+        hmm = GaussianHMM(
+            n_components=3,
+            covariance_type="full",
+            n_iter=300,
+            random_state=42
+        )
+        hmm.fit(X_use)
+
+        states_use = pd.Series(hmm.predict(X_use), index=idx_obs, name="state")
+        proba_use  = pd.DataFrame(hmm.predict_proba(X_use), index=idx_obs)
+
+        net_os = pd.concat([net_daily.reindex(idx_obs), states_use], axis=1).dropna()
+        means  = net_os.groupby("state")["NetDailyPnL"].mean()
+        stress_reg = int(means.idxmin())
+
+        p_stress_use = (
+            proba_use.iloc[:, stress_reg]
+                     .rename("p_stress")
+                     .reindex(base_index)
+                     .ffill()
+        )
+        A = hmm.transmat_
+
+    # ---------------- 1) Prévision de stress à horizon h ----------------
+    st.markdown("### 1. Prévision de régime (HMM)")
+
+    n_states = A.shape[0]
+    last_proba_date = proba_use.index[-1]
+    p_t = proba_use.loc[last_proba_date].values   # proba aujourd'hui
+
+    horizon = st.slider("Horizon de prévision (jours)", 1, 10, 1, 1, key="tab5_horizon")
+    A_h = np.linalg.matrix_power(A, int(horizon))
+    p_future = p_t @ A_h
+
+    # proba de chaque régime à T + h
+    df_reg_forecast = pd.DataFrame({
+        "Regime": [f"Regime {k}" for k in range(n_states)],
+        f"Proba à T+{horizon}": p_future
+    })
+
+    p_stress_future = float(p_future[stress_reg])
+
+    c1, c2 = st.columns([2,1])
+    with c1:
+        st.dataframe(
+            df_reg_forecast.set_index("Regime"),
+            use_container_width=True,
+            height=200
+        )
+    with c2:
+        p_today = float(p_stress_use.iloc[-1])
+        st.metric("p_stress aujourd'hui", f"{100.0 * p_today:.1f} %")
+        st.metric(f"p_stress à T+{horizon}", f"{100.0 * p_stress_future:.1f} %")
+
+    # ---------------- 2) Alpha futur basé sur p_stress_future ----------------
+    st.markdown("### 2. Alpha futur (fonction de p_stress future)")
+
+    if p_stress_future < tau1:
+        alpha_future = 0.0
+    elif p_stress_future < tau2:
+        alpha_future = 0.3
+    elif p_stress_future < tau3:
+        alpha_future = 0.6
+    else:
+        alpha_future = 1.0
+
+    st.write(
+        f"Mapping p_stress(T+{horizon}) → α_future : **{alpha_future:.1f}** "
+        f"(τ1={tau1:.2f}, τ2={tau2:.2f}, τ3={tau3:.2f})"
+    )
+
+    # ---------------- 3) DV01 snapshot & hedge auto ----------------
+    st.markdown("### 3. Hedge auto sur DV01 courants")
+
+    # snapshot DV01 dernier jour (risk_ts)
+    risk_last_idx = risk_ts.dropna(how="all").index[-1]
+    dv01_last = (
+        risk_ts.loc[risk_last_idx]
+               .reindex(pnl_by_factor.columns)
+               .fillna(0.0)
+    )
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    hedge_rows = []
+    for c, dv in dv01_last.items():
+        if dv == 0.0 or not np.isfinite(dv):
+            continue
+
+        bucket = _bucket(c)
+        unit_cost = (
+            cost_rate if bucket == "Rates"
+            else cost_xccy if bucket == "XCCY"
+            else cost_fx
+        )
+
+        hedge_units = - alpha_future * dv  # hedge en DV01 du constituant
+        cost_alloc = abs(hedge_units) * unit_cost
+
+        hedge_rows.append({
+            "Constituant": c,
+            "Bucket": bucket,
+            "DV01_current": dv,
+            "Alpha_future": alpha_future,
+            "Hedge_DV01_suggested": hedge_units,
+            "UnitCost": unit_cost,
+            "Cost_estimated": cost_alloc
+        })
+
+    if not hedge_rows:
+        st.info("Pas de DV01 non-nul sur le dernier snapshot : aucun hedge proposé.")
+    else:
+        hedge_df = (
+            pd.DataFrame(hedge_rows)
+              .set_index("Constituant")
+              .sort_values("DV01_current", key=lambda s: s.abs(), ascending=False)
+        )
+
+        # résumé global
+        total_dv01 = hedge_df["DV01_current"].sum()
+        total_cost = hedge_df["Cost_estimated"].sum()
+
+        c3, c4 = st.columns(2)
+        c3.metric("DV01 total (snapshot)", f"{total_dv01:,.0f}")
+        c4.metric("Coût total estimé hedge auto", f"{total_cost:,.0f}")
+
+        st.dataframe(
+            hedge_df,
+            use_container_width=True,
+            height=420
+        )
