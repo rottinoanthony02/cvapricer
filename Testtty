@@ -1,0 +1,130 @@
+# ============================================
+# PNL GLOBAL — BASE (TAB1) VS HEDGÉ (TAB3)
+# ============================================
+
+# 1) INDEX & FACTEURS
+base_index = pnl_by_factor.index
+factors    = list(pnl_by_factor.columns)
+
+# 2) PNL BASE = EXACTEMENT TAB1
+#    -> on réutilise net_daily (somme des contributions par facteur)
+pnl_base = net_daily.reindex(base_index).fillna(0.0).rename("PnL_base")
+cum_base = pnl_base.cumsum().rename("Cum_Base")
+
+# 3) DRIVERS DE MARCHÉ (pour les overlays uniquement)
+driver_df = (
+    mkt_change.reindex(base_index)
+              .reindex(columns=factors)
+              .fillna(0.0)
+)
+
+# 4) OVERLAY RATES / XCCY EN DV01
+#    On part de plan_df avec au moins :
+#    - Date
+#    - Bucket ∈ {"Rates","XCCY","FX"}
+#    - HedgeFactor (nom du facteur dans risk_ts / mkt_change / pnl_by_factor)
+#    - HedgeUnits (DV01 / FX01 dans la même unité que risk_ts pour Rates/XCCY)
+if 'plan_df' not in locals() or plan_df.empty:
+    H_rates = pd.DataFrame(0.0, index=base_index, columns=factors)
+else:
+    plan_rates = plan_df[plan_df["Bucket"].isin(["Rates", "XCCY"])].copy()
+
+    if plan_rates.empty:
+        H_rates = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        # Δ position DV01 par Date / HedgeFactor
+        hedge_delta_rates = (
+            plan_rates
+            .groupby(["Date", "HedgeFactor"])["HedgeUnits"]
+            .sum()
+            .unstack(fill_value=0.0)
+        )
+
+        hedge_delta_rates = (
+            hedge_delta_rates
+            .reindex(base_index)
+            .reindex(columns=factors, fill_value=0.0)
+        )
+
+        # Positions persistantes en DV01
+        H_rates = hedge_delta_rates.cumsum()
+
+# PnL overlay Rates/XCCY = Σ_i H_rates_{t-1,i} * ΔMkt_{t,i}
+pnl_hedge_rates = (H_rates.shift(1) * driver_df).sum(axis=1).rename("PnL_hedge_rates")
+
+# 5) OVERLAY FX EN NOTIONAL
+#    On part de plan_df avec :
+#    - Bucket == "FX"
+#    - FXFactor (colonne FX dans mkt_change / pnl_by_factor)
+#    - FXNotional (notional FX en USD (ou devise PnL))
+if 'plan_df' not in locals() or plan_df.empty:
+    fx_notional_pos = pd.DataFrame(0.0, index=base_index, columns=factors)
+else:
+    plan_fx = plan_df[plan_df["Bucket"] == "FX"].copy()
+
+    if plan_fx.empty:
+        fx_notional_pos = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        fx_notional_delta = (
+            plan_fx
+            .groupby(["Date", "FXFactor"])["FXNotional"]
+            .sum()
+            .unstack(fill_value=0.0)
+        )
+
+        fx_notional_delta = (
+            fx_notional_delta
+            .reindex(base_index)
+            .reindex(columns=factors, fill_value=0.0)
+        )
+
+        # Positions persistantes en notionnel FX
+        fx_notional_pos = fx_notional_delta.cumsum()
+
+# PnL overlay FX = Σ_j Notional_j,t-1 * ΔFX_j,t
+pnl_hedge_fx = (fx_notional_pos.shift(1) * driver_df).sum(axis=1).rename("PnL_hedge_fx")
+
+# 6) COÛT DE HEDGE
+if 'plan_df' not in locals() or plan_df.empty:
+    cost_series = pd.Series(0.0, index=base_index, name="HedgeCost")
+else:
+    cost_series = (
+        plan_df.groupby("Date")["HedgeCost"]
+               .sum()
+               .reindex(base_index)
+               .fillna(0.0)
+               .rename("HedgeCost")
+    )
+
+# 7) PNL APRÈS HEDGE = BASE + OVERLAYS - COÛTS
+pnl_after = (pnl_base + pnl_hedge_rates + pnl_hedge_fx - cost_series).rename("PnL_after")
+cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+# 8) GRAPHIQUE CUMULÉ
+figF, axF = plt.subplots(figsize=(12, 4), dpi=120)
+axF.plot(cum_base.index,  cum_base.values,  label="Cumul Base (Tab1)")
+axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé")
+auto_xticks(axF, cum_base.index)
+format_yaxis_plain(axF)
+axF.set_title("Cumulative PnL — Base vs Hedgé")
+axF.legend(loc="upper left")
+st.pyplot(figF)
+
+# 9) MÉTRIQUES SYNTHÉTIQUES
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Δ Cumul (Hedgé - Base)", f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+with k2:
+    st.metric("Coût total hedge", f"{float(cost_series.sum()):,.0f}")
+with k3:
+    st.metric("Vol PnL base / hedgé",
+              f"{pnl_base.std():,.0f} / {pnl_after.std():,.0f}")
+
+# (optionnel) afficher décomposition des PnL
+with st.expander("Décomposition PnL (base / rates-xccy / FX / coût)", expanded=False):
+    pnl_decomp = pd.concat([pnl_base, pnl_hedge_rates, pnl_hedge_fx, cost_series, pnl_after], axis=1)
+    st.dataframe(
+        pnl_decomp.tail(60).style.format("{:,.0f}"),
+        use_container_width=True,
+        height=320
+    )
