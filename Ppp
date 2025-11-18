@@ -1,0 +1,109 @@
+# ============================================
+# PNL — BASE (TAB1) VS HEDGÉ (TAB3)
+# Compatible avec plan_df:
+#   Date, Mode, Constituant_target, Proxy,
+#   HedgeUnits, Bucket, UnitCost, CostAlloc
+# ============================================
+
+import numpy as np
+import pandas as pd
+
+# ---------- Sécurité plan_df ----------
+if "plan_df" not in locals():
+    plan_df = pd.DataFrame(columns=[
+        "Date", "Mode", "Constituant_target", "Proxy",
+        "HedgeUnits", "Bucket", "UnitCost", "CostAlloc"
+    ])
+
+for col in ["Date", "Proxy", "HedgeUnits", "CostAlloc"]:
+    if col not in plan_df.columns:
+        plan_df[col] = np.nan
+
+# Date en datetime, tri
+plan_df["Date"] = pd.to_datetime(plan_df["Date"], errors="coerce")
+plan_df = plan_df.sort_values("Date")
+
+# ---------- Index & facteurs ----------
+base_index = pnl_by_factor.index
+factors    = list(pnl_by_factor.columns)
+
+# ---------- PnL base = exactement Tab1 ----------
+pnl_base = net_daily.reindex(base_index).fillna(0.0).rename("PnL_base")
+cum_base = pnl_base.cumsum().rename("Cum_Base")
+
+# ---------- Drivers de marché ----------
+driver_df = (
+    mkt_change.reindex(base_index)
+              .reindex(columns=factors)
+              .fillna(0.0)
+)
+
+# ---------- Overlay de hedge (tous Proxy) ----------
+# On garde seulement les lignes avec Proxy + HedgeUnits définis
+plan_nonempty = plan_df[
+    plan_df["Proxy"].notna() & plan_df["HedgeUnits"].notna()
+].copy()
+
+# Matrice des positions de hedge H(t,i)
+if plan_nonempty.empty:
+    H = pd.DataFrame(0.0, index=base_index, columns=factors)
+else:
+    # pivot: Date x Proxy -> HedgeUnits (Δ position au jour t)
+    hedge_incr = (
+        plan_nonempty.pivot_table(
+            index="Date",
+            columns="Proxy",
+            values="HedgeUnits",
+            aggfunc="sum",
+            fill_value=0.0,
+        )
+        .reindex(base_index)                          # mêmes dates que le PnL
+        .reindex(columns=factors, fill_value=0.0)     # mêmes colonnes que pnl_by_factor
+    )
+
+    # positions persistantes (cumulées)
+    H = hedge_incr.cumsum()
+
+# PnL overlay hedge = Σ_i H_{t-1,i} * ΔMkt_{t,i}
+pnl_hedge = (H.shift(1) * driver_df).sum(axis=1).rename("PnL_hedge")
+
+# ---------- Coût de hedge ----------
+cost_series = (
+    plan_df.groupby("Date")["CostAlloc"]
+           .sum()
+           .reindex(base_index)
+           .fillna(0.0)
+).rename("HedgeCost")
+
+# ---------- PnL après hedge ----------
+pnl_after = (pnl_base + pnl_hedge - cost_series).rename("PnL_after")
+cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+# ---------- Graphique cumulé ----------
+figF, axF = plt.subplots(figsize=(12, 4), dpi=120)
+axF.plot(cum_base.index,  cum_base.values,  label="Cumul Base (Tab1)")
+axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé")
+auto_xticks(axF, cum_base.index)
+format_yaxis_plain(axF)
+axF.set_title("Cumulative PnL — Base vs Hedgé (overlay Proxy)")
+axF.legend(loc="upper left")
+st.pyplot(figF)
+
+# ---------- Métriques ----------
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Δ Cumul (Hedgé - Base)", f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+with k2:
+    st.metric("Coût total hedge", f"{float(cost_series.sum()):,.0f}")
+with k3:
+    st.metric("Vol PnL base / hedgé",
+              f"{pnl_base.std():,.0f} / {pnl_after.std():,.0f}")
+
+# ---------- Décomposition PnL (optionnel) ----------
+with st.expander("Décomposition PnL (base / hedge / coût / after)", expanded=False):
+    pnl_decomp = pd.concat([pnl_base, pnl_hedge, cost_series, pnl_after], axis=1)
+    st.dataframe(
+        pnl_decomp.tail(60).style.format("{:,.0f}"),
+        use_container_width=True,
+        height=320
+    )
