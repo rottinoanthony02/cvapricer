@@ -1,0 +1,48 @@
+    # --------------------------------------------------------
+    # GRAPH — Rolling β(dtype ← constituant)
+    # --------------------------------------------------------
+    if dtype not in mkt_change.columns:
+        st.warning(f"dtype '{dtype}' absent de mkt_change, impossible de tracer le β rolling.")
+    else:
+        st.subheader("Rolling β (dtype ← constituant)")
+
+        factor_beta_choice = st.selectbox(
+            "Constituant pour le β rolling",
+            options=factors,
+            index=0,
+            key="tab3_beta_factor_choice"
+        )
+
+        if factor_beta_choice not in mkt_change.columns:
+            st.info(f"{factor_beta_choice} absent de mkt_change, pas de β rolling disponible.")
+        else:
+            # Série de marché pour dtype (y) et constituant (x)
+            y_b = mkt_change[dtype].astype(float).rename("y")
+            x_b = mkt_change[factor_beta_choice].astype(float).rename("x")
+
+            df_b = pd.concat([x_b, y_b], axis=1).dropna()
+
+            if len(df_b) < int(win_beta):
+                st.info(f"Pas assez de points pour calculer un β rolling sur {win_beta} jours.")
+            else:
+                roll_cov = df_b["x"].rolling(int(win_beta)).cov(df_b["y"])
+                roll_var = df_b["x"].rolling(int(win_beta)).var()
+                beta_roll = (roll_cov / (roll_var.replace(0.0, np.nan))).rename("beta_roll")
+
+                # On recentre sur l'index global pour tracer proprement
+                beta_roll_full = beta_roll.reindex(base_index)
+
+                figB, axB = plt.subplots(figsize=(12, 3), dpi=120)
+                axB.plot(beta_roll_full.index, beta_roll_full.values, lw=1.2, label=f"β_rolling({dtype} ← {factor_beta_choice})")
+                
+                # ligne horizontale = β global utilisé dans le hedge (si dispo)
+                beta_global_val = float(betas_dtype.get(factor_beta_choice, np.nan))
+                if np.isfinite(beta_global_val):
+                    axB.axhline(beta_global_val, ls="--", lw=0.8, label=f"β global ≈ {beta_global_val:.3f}")
+
+                axB.set_title(f"Rolling β ({dtype} ← {factor_beta_choice}) — fenêtre {int(win_beta)} jours")
+                axB.set_ylabel("β")
+                auto_xticks(axB, beta_roll_full.index)
+                format_yaxis_plain(axB)
+                axB.legend(loc="upper left")
+                st.pyplot(figB)
