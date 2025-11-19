@@ -1,0 +1,158 @@
+with tab2:
+    st.subheader("TAB 2 — Structural Risk Map (Global PCA + Clusters + Local PCA)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.cluster import KMeans
+
+    # ================================
+    # A. PARAMETERS
+    # ================================
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        win_pca = st.slider("Rolling window PCA (days)", 60, 600, 250, 10, key="tab2_win_pca")
+    with c2:
+        n_clusters = st.slider("Nb clusters per bucket", 1, 8, 3, 1, key="tab2_n_clusters")
+    with c3:
+        min_obs = st.number_input("Min obs per PCA", 30, 300, 50, 10, key="tab2_min_obs")
+
+    # utility bucket function
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    factors = list(pnl_by_factor.columns)
+
+    # daily changes dPnL
+    dPnL = pnl_by_factor.diff().replace([np.inf,-np.inf], np.nan)
+    dPnL = dPnL.dropna(how="any")
+
+    # ================================
+    # B. GLOBAL PCA
+    # ================================
+    st.markdown("### Global PCA on dPnL")
+
+    if len(dPnL) < min_obs:
+        st.error("Not enough data for PCA.")
+    else:
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(dPnL.values)
+
+        pca = PCA(n_components=1)
+        PC1 = pca.fit_transform(X_scaled).ravel()
+
+        PC1_z = (PC1 - PC1.mean()) / (PC1.std(ddof=1) + 1e-12)
+        PCA_stress = np.clip(np.abs(PC1_z) / 3, 0, 1)
+
+        PCA_stress = pd.Series(PCA_stress, index=dPnL.index, name="PCA_stress_global")
+
+        # display graph
+        figG, axG = plt.subplots(figsize=(12,4), dpi=120)
+        axG.plot(PCA_stress.index, PCA_stress.values, label="Global PCA Stress")
+        axG.axhline(0.7, color="red", ls="--", lw=1)
+        axG.legend()
+        auto_xticks(axG, PCA_stress.index)
+        axG.set_title("Global PCA Stress (0–1)")
+        st.pyplot(figG)
+
+    # ================================
+    # C. CLUSTERING (bucket + KMeans)
+    # ================================
+    st.markdown("### Clustering (bucket → KMeans on correlation matrix)")
+
+    buckets = pd.Series({c:_bucket(c) for c in factors})
+    corr_mat = dPnL.corr().fillna(0.0)
+
+    cluster_map = pd.Series(index=factors, dtype="int")
+    current_id = 1
+
+    for bkt in ["Rates", "XCCY", "FX"]:
+        cols_b = [c for c in factors if buckets[c] == bkt]
+        if not cols_b:
+            continue
+
+        corr_b = corr_mat.loc[cols_b, cols_b]
+
+        k = min(n_clusters, len(cols_b))
+        if k <= 1:
+            for c in cols_b:
+                cluster_map[c] = current_id
+            current_id += 1
+            continue
+
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = km.fit_predict(corr_b.values)
+
+        for c_name, lab in zip(cols_b, labels):
+            cluster_map[c_name] = current_id + lab
+
+        current_id += k
+
+    cluster_map = cluster_map.astype(int)
+    cluster_df = pd.DataFrame({"Cluster":cluster_map, "Bucket":buckets})
+
+    with st.expander("Cluster Map"):
+        st.dataframe(cluster_df.sort_values(["Bucket","Cluster"]), use_container_width=True)
+
+    # ================================
+    # D. LOCAL PCA IN EACH CLUSTER
+    # ================================
+    st.markdown("### PCA inside each cluster")
+
+    cluster_ids = sorted(cluster_map.unique())
+    pca_stress_cluster = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+
+    for cid in cluster_ids:
+        cols = cluster_map[cluster_map == cid].index.tolist()
+        if len(cols) < 2:
+            continue
+
+        dC = dPnL[cols].dropna(how="any")
+        if len(dC) < min_obs:
+            continue
+
+        scaler2 = StandardScaler()
+        Xc = scaler2.fit_transform(dC.values)
+
+        pca_c = PCA(n_components=1)
+        PC1c = pca_c.fit_transform(Xc).ravel()
+
+        PC1c_z = (PC1c - PC1c.mean()) / (PC1c.std(ddof=1) + 1e-12)
+        stress_c = np.clip(np.abs(PC1c_z) / 3, 0, 1)
+
+        pca_stress_cluster[cid] = pd.Series(stress_c, index=dC.index)
+
+    # display cluster PCA summary
+    with st.expander("Cluster PCA Stress Summary"):
+        summary = []
+        for cid in cluster_ids:
+            s = pca_stress_cluster[cid]
+            summary.append({
+                "Cluster": cid,
+                "Nb_factors": int((cluster_map == cid).sum()),
+                "Mean_Stress": float(s.mean()),
+                "P95_Stress": float(s.quantile(0.95)),
+                "%Stress>0.7": float((s>0.7).mean()*100),
+            })
+        df_sum = pd.DataFrame(summary).set_index("Cluster")
+        st.dataframe(df_sum.style.format({
+            "Mean_Stress":"{:.2f}",
+            "P95_Stress":"{:.2f}",
+            "%Stress>0.7":"{:.1f}"
+        }), use_container_width=True)
+
+    # ================================
+    # EXPORT OBJECTS FOR TAB 3
+    # ================================
+    st.session_state["TAB2_PCA_STRESS_GLOBAL"]   = PCA_stress
+    st.session_state["TAB2_CLUSTER_MAP"]         = cluster_map
+    st.session_state["TAB2_PCA_STRESS_CLUSTER"]  = pca_stress_cluster
+
+    st.success("Tab 2 objects exported: PCA_global, clusters, cluster_PCA")
