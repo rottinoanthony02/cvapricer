@@ -1,0 +1,393 @@
+with tab2:
+    st.subheader("TAB 2 — Structural Risk Map (PCA + Auto-Clusters + Stress Tags)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from sklearn.decomposition import PCA
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    # =========================================================
+    # A) PARAMÈTRES
+    # =========================================================
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        win_pca = st.slider("Rolling window PCA (days)", 60, 600, 250, 10, key="tab2_win_pca")
+    with c2:
+        n_clusters_max = st.slider("Max clusters per bucket", 1, 8, 3, 1, key="tab2_n_clusters_max")
+    with c3:
+        min_obs = st.number_input("Min obs per PCA (cluster)", 20, 300, 60, 5, key="tab2_min_obs")
+
+    # ---------------------------------------------------------
+    # Helper bucket
+    # ---------------------------------------------------------
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    factors = list(pnl_by_factor.columns)
+    buckets = pd.Series({c: _bucket(c) for c in factors}, name="Bucket")
+
+    # ---------------------------------------------------------
+    # dPnL (base pour PCA + corr)
+    # ---------------------------------------------------------
+    dPnL = (
+        pnl_by_factor
+        .diff()
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(how="any")
+    )
+
+    if len(dPnL) < min_obs:
+        st.error("Not enough history for PCA (min_obs too large).")
+        st.stop()
+
+    dPnL_win = dPnL.tail(win_pca)
+
+    # =========================================================
+    # B) GLOBAL PCA → PCA_stress_global
+    # =========================================================
+    st.markdown("### Global PCA on dPnL")
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(dPnL_win.values)
+
+    pca_global = PCA(n_components=1, random_state=42)
+    PC1 = pca_global.fit_transform(X).ravel()
+    PC1_z = (PC1 - PC1.mean()) / (PC1.std(ddof=1) + 1e-12)
+
+    PCA_stress = np.clip(np.abs(PC1_z) / 3.0, 0.0, 1.0)
+    PCA_stress = pd.Series(PCA_stress, index=dPnL_win.index, name="PCA_stress_global")
+
+    PCA_stress_full = (
+        PCA_stress
+        .reindex(pnl_by_factor.index)
+        .ffill()
+        .fillna(0.0)
+    )
+
+    figP, axP = plt.subplots(figsize=(12,4), dpi=120)
+    axP.plot(PCA_stress_full.index, PCA_stress_full.values, label="Global PCA stress", lw=1.5)
+    axP.axhline(0.5, color="orange", ls="--", lw=1, alpha=0.6, label="Medium")
+    axP.axhline(0.7, color="red", ls="--", lw=1, alpha=0.6, label="Crisis")
+    axP.set_ylim(0, 1.05)
+    axP.set_title("Global PCA(1) stress (0–1)")
+    auto_xticks(axP, PCA_stress_full.index)
+    axP.legend(loc="upper left")
+    st.pyplot(figP)
+
+    # =========================================================
+    # C) MATRICE DE CORRÉLATION
+    # =========================================================
+    corr_mat = dPnL.corr().fillna(0.0)
+
+    # =========================================================
+    # D) AUTO-KMEANS PAR BUCKET (sans singleton)
+    # =========================================================
+    st.markdown("### Clustering (bucket + auto-KMeans, no singleton clusters)")
+
+    def auto_kmeans_for_bucket(corr_block: pd.DataFrame, max_k: int):
+        """
+        Choisit k ≤ max_k pour un bloc de corrélation, en évitant les singletons.
+        Score = silhouette si dispo, sinon -inertia. Retourne (labels, k_choisi).
+        """
+        cols = corr_block.columns.tolist()
+        n = len(cols)
+        if n <= 2:
+            # Trop peu de facteurs → 1 cluster
+            return np.zeros(n, dtype=int), 1
+
+        # Pour garantir ≥2 facteurs par cluster: k ≤ n//2
+        k_max = min(max_k, max(1, n // 2))
+
+        best_k = 1
+        best_score = -np.inf
+        best_labels = np.zeros(n, dtype=int)
+        Xb = corr_block.values
+
+        for k in range(1, k_max + 1):
+            km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = km.fit_predict(Xb)
+            sizes = pd.Series(labels).value_counts()
+
+            # pas de singleton si k>1
+            if k > 1 and (sizes < 2).any():
+                continue
+
+            inertia = km.inertia_
+            sil = None
+            if k > 1 and n > k:
+                try:
+                    sil = silhouette_score(Xb, labels, metric="euclidean")
+                except Exception:
+                    sil = None
+
+            if sil is not None:
+                score = sil
+            else:
+                score = -inertia
+
+            if score > best_score:
+                best_score = score
+                best_k = k
+                best_labels = labels
+
+        return best_labels, best_k
+
+    cluster_labels = pd.Series(index=factors, dtype="float")
+    current_cluster_id = 1
+    bucket_used_k = {}
+
+    for bkt in ["Rates", "XCCY", "FX"]:
+        cols_b = [c for c in factors if buckets[c] == bkt]
+        if len(cols_b) == 0:
+            continue
+
+        corr_b = corr_mat.loc[cols_b, cols_b]
+        labels_b, k_b = auto_kmeans_for_bucket(corr_b, int(n_clusters_max))
+        bucket_used_k[bkt] = k_b
+
+        for f_name, lab in zip(cols_b, labels_b):
+            cluster_labels[f_name] = current_cluster_id + lab
+
+        current_cluster_id += k_b
+
+    cluster_map = cluster_labels.astype(int)
+    cluster_df = pd.concat([cluster_map.rename("Cluster"), buckets], axis=1)
+
+    with st.expander("Cluster map (Bucket + Cluster)", expanded=False):
+        st.write("Effective k per bucket:", bucket_used_k)
+        st.dataframe(
+            cluster_df.sort_values(["Bucket","Cluster"]),
+            use_container_width=True,
+            height=320
+        )
+
+    # Heatmap corr triée
+    sorted_idx = cluster_df.sort_values(["Bucket","Cluster"]).index
+    sorted_corr = corr_mat.loc[sorted_idx, sorted_idx]
+
+    with st.expander("ΔPnL correlation heatmap (by Bucket & Cluster)", expanded=False):
+        figC, axC = plt.subplots(figsize=(6,5), dpi=120)
+        im = axC.imshow(sorted_corr.values, aspect="auto")
+        axC.set_xticks(range(len(sorted_idx)))
+        axC.set_yticks(range(len(sorted_idx)))
+        axC.set_xticklabels(sorted_idx, rotation=90, fontsize=6)
+        axC.set_yticklabels(sorted_idx, fontsize=6)
+        axC.set_title("Corr(ΔPnL) sorted by Bucket & Cluster")
+        figC.colorbar(im, ax=axC, fraction=0.046, pad=0.04)
+        st.pyplot(figC)
+
+    # =========================================================
+    # E) PCA(1) PAR CLUSTER → STRESS LOCAL
+    # =========================================================
+    st.markdown("### PCA(1) inside each cluster")
+
+    cluster_ids = sorted(cluster_map.dropna().unique())
+    pca_stress_cluster = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+    eps = 1e-12
+
+    for cid in cluster_ids:
+        cols_c = cluster_map[cluster_map == cid].index.tolist()
+        if len(cols_c) < 2:
+            continue
+
+        dC = dPnL[cols_c].dropna(how="any")
+        if len(dC) < min_obs:
+            continue
+
+        scaler_c = StandardScaler()
+        Xc = scaler_c.fit_transform(dC.values)
+
+        pca_c = PCA(n_components=1, random_state=42)
+        PC1c = pca_c.fit_transform(Xc).ravel()
+        z = (PC1c - PC1c.mean()) / (PC1c.std(ddof=1) + eps)
+        stress_c = np.clip(np.abs(z) / 3.0, 0.0, 1.0)
+
+        pca_stress_cluster.loc[dC.index, cid] = stress_c
+
+    # align sur l’index complet
+    pca_stress_cluster_full = (
+        pca_stress_cluster
+        .reindex(pnl_by_factor.index)
+        .ffill()
+        .fillna(0.0)
+    )
+
+    # =========================================================
+    # F) VISU — PCA GLOBAL + PNL, SCREE, CLUSTER MAP
+    # =========================================================
+    st.markdown("### Global PCA dashboard")
+
+    fig_g, ax1 = plt.subplots(figsize=(12,4), dpi=120)
+    ax1.plot(PCA_stress_full.index, PCA_stress_full.values, label="PCA_stress_global", lw=1.5)
+    ax1.set_ylim(0, 1.05)
+    ax1.set_ylabel("Stress (0–1)")
+    ax1.axhline(0.5, color="orange", ls="--", alpha=0.6)
+    ax1.axhline(0.7, color="red", ls="--", alpha=0.6)
+
+    ax2 = ax1.twinx()
+    net_aligned = net_daily.reindex(PCA_stress_full.index)
+    ax2.plot(net_aligned.index, net_aligned.values, color="grey", alpha=0.4, lw=1, label="NetDailyPnL")
+    ax2.set_ylabel("NetDailyPnL")
+
+    auto_xticks(ax1, PCA_stress_full.index)
+    ax1.set_title("Global PCA stress vs Net PnL")
+    fig_g.legend(loc="upper left", bbox_to_anchor=(0,1), bbox_transform=ax1.transAxes)
+    st.pyplot(fig_g)
+
+    # Scree plot global
+    n_comp = min(5, len(factors))
+    scaler_dbg = StandardScaler()
+    X_dbg = scaler_dbg.fit_transform(dPnL_win.values)
+    pca_dbg = PCA(n_components=n_comp, random_state=42)
+    pca_dbg.fit(X_dbg)
+    expl_var = pca_dbg.explained_variance_ratio_
+
+    fig_s, ax_s = plt.subplots(figsize=(6,3), dpi=120)
+    ax_s.bar(range(1, n_comp+1), expl_var*100)
+    ax_s.set_xlabel("PC index")
+    ax_s.set_ylabel("% variance explained")
+    ax_s.set_title("Global PCA scree plot")
+    for i, v in enumerate(expl_var):
+        ax_s.text(i+1, v*100+0.5, f"{v*100:.1f}%", ha="center", fontsize=8)
+    st.pyplot(fig_s)
+
+    # Cluster composition + stress
+    st.markdown("### Cluster risk map (composition + stress)")
+
+    cluster_counts = cluster_df.groupby(["Bucket","Cluster"]).size().rename("Count").reset_index()
+
+    fig_c2, ax_c2 = plt.subplots(figsize=(8,4), dpi=120)
+    xpos = np.arange(len(cluster_counts))
+    ax_c2.bar(xpos, cluster_counts["Count"])
+    ax_c2.set_xticks(xpos)
+    ax_c2.set_xticklabels(
+        [f"{b}\nC{cl}" for b, cl in zip(cluster_counts["Bucket"], cluster_counts["Cluster"])],
+        rotation=45, ha="right", fontsize=8
+    )
+    ax_c2.set_ylabel("# factors")
+    ax_c2.set_title("Cluster composition")
+    st.pyplot(fig_c2)
+
+    if not pca_stress_cluster_full.empty:
+        fig_sc, ax_sc = plt.subplots(figsize=(12,4), dpi=120)
+        for cid in pca_stress_cluster_full.columns:
+            ax_sc.plot(pca_stress_cluster_full.index, pca_stress_cluster_full[cid],
+                       label=f"Cluster {cid}", lw=1)
+        ax_sc.set_ylim(0, 1.05)
+        ax_sc.set_title("Cluster PCA(1) stress")
+        auto_xticks(ax_sc, pca_stress_cluster_full.index)
+        ax_sc.legend(loc="upper left", ncols=3, fontsize=7)
+        st.pyplot(fig_sc)
+
+    # PCA loadings explorer
+    st.markdown("### PCA loadings explorer (inside cluster)")
+
+    if cluster_map is not None:
+        cluster_ids_nonnull = sorted(cluster_map.dropna().unique())
+        cid_sel = st.selectbox("Select a cluster to inspect", cluster_ids_nonnull, key="tab2_cluster_select")
+
+        cols_c = cluster_map[cluster_map == cid_sel].index.tolist()
+        dC = dPnL[cols_c].dropna(how="any")
+        if len(cols_c) < 2 or len(dC) < min_obs:
+            st.info("Not enough data or too few factors in this cluster for PCA loadings.")
+        else:
+            scaler_c = StandardScaler()
+            Xc = scaler_c.fit_transform(dC.values)
+            pca_c = PCA(n_components=1, random_state=42)
+            pca_c.fit(Xc)
+
+            loadings = pd.Series(pca_c.components_[0], index=cols_c).sort_values(key=np.abs, ascending=False)
+
+            fig_l, ax_l = plt.subplots(figsize=(10,4), dpi=120)
+            loadings.plot(kind="bar", ax=ax_l)
+            ax_l.axhline(0, color="black", lw=0.8)
+            ax_l.set_title(f"PC1 loadings — Cluster {cid_sel}")
+            ax_l.tick_params(axis="x", rotation=45, labelsize=8)
+            st.pyplot(fig_l)
+
+            with st.expander("Loadings table", expanded=False):
+                st.dataframe(
+                    loadings.to_frame("PC1_loading").style.format({"PC1_loading": "{:+.3f}"}),
+                    use_container_width=True
+                )
+    else:
+        st.info("No cluster_map available for PCA loadings explorer.")
+
+    # =========================================================
+    # G) STRESS TAGGING (GLOBAL & CLUSTER)
+    # =========================================================
+    st.markdown("### Stress tagging (global & per cluster)")
+
+    t1, t2 = st.columns(2)
+    with t1:
+        thr_medium = st.slider("Global Medium threshold", 0.0, 1.0, 0.30, 0.05, key="tab2_thr_medium")
+    with t2:
+        thr_crisis = st.slider("Global Crisis threshold", 0.0, 1.0, 0.70, 0.05, key="tab2_thr_crisis")
+
+    def tag_global_stress(v: float) -> str:
+        if v < thr_medium:
+            return "Calm"
+        elif v < thr_crisis:
+            return "Medium"
+        return "Crisis"
+
+    stress_tag_global = PCA_stress_full.apply(tag_global_stress)
+    stress_tag_global.name = "StressRegime"
+
+    with st.expander("Global stress regime distribution", expanded=False):
+        freq_abs = stress_tag_global.value_counts().rename("Days")
+        freq_rel = (freq_abs / freq_abs.sum()).rename("Frequency")
+        summary_stress_regimes = pd.concat([freq_abs, freq_rel], axis=1)
+        st.dataframe(
+            summary_stress_regimes.style.format({"Frequency": "{:.1%}"}),
+            use_container_width=True
+        )
+
+    # Flags de stress par cluster (en utilisant thr_crisis)
+    cluster_stress_flag = (pca_stress_cluster_full >= thr_crisis)
+
+    rows_cl = []
+    for cid in cluster_ids:
+        s = pca_stress_cluster_full[cid]
+        rows_cl.append({
+            "Cluster": cid,
+            "% days stressed": float((s >= thr_crisis).mean() * 100),
+            "Mean_stress": float(s.mean()),
+            "P95_stress": float(s.quantile(0.95)),
+        })
+
+    if rows_cl:
+        cluster_stress_summary = (
+            pd.DataFrame(rows_cl)
+            .set_index("Cluster")
+            .sort_values("% days stressed", ascending=False)
+        )
+        with st.expander("Cluster stress summary", expanded=False):
+            st.dataframe(
+                cluster_stress_summary.style.format({
+                    "% days stressed": "{:.1f}",
+                    "Mean_stress": "{:.2f}",
+                    "P95_stress": "{:.2f}",
+                }),
+                use_container_width=True
+            )
+
+    # =========================================================
+    # H) EXPORTS POUR TAB 3 / TAB 4
+    # =========================================================
+    st.session_state["TAB2_PCA_STRESS_GLOBAL"]   = PCA_stress_full
+    st.session_state["TAB2_CLUSTER_MAP"]         = cluster_map
+    st.session_state["TAB2_PCA_STRESS_CLUSTER"]  = pca_stress_cluster_full
+    st.session_state["TAB2_CLUSTER_DF"]          = cluster_df
+    st.session_state["TAB2_STRESS_TAG_GLOBAL"]   = stress_tag_global
+    st.session_state["TAB2_CLUSTER_STRESS_FLAG"] = cluster_stress_flag
+
+    st.success("Tab 2 ready — objects exported for Tab 3 / Tab 4.")
