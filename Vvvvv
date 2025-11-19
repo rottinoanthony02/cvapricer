@@ -1,0 +1,313 @@
+with tab3:
+    st.subheader("TAB 3 — Spot Hedge Engine (PCA-only, DV01 constituant OWN + Cross-Hedge XCCY)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    # =========================================================
+    # A) LOAD FROM TAB 2
+    # =========================================================
+    pca_stress_global = st.session_state.get("TAB2_PCA_STRESS_GLOBAL", None)
+    cluster_map        = st.session_state.get("TAB2_CLUSTER_MAP", None)
+
+    if pca_stress_global is None:
+        st.error("Run Tab 2 first — PCA stress not found.")
+        st.stop()
+
+    base_index = pnl_by_factor.index
+
+    pca_stress_global = (
+        pd.Series(pca_stress_global)
+        .reindex(base_index)
+        .ffill()
+        .fillna(0.0)
+        .rename("PCA_stress_global")
+    )
+
+    # =========================================================
+    # B) PARAMETERS
+    # =========================================================
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        topN = st.slider("Top N factors / day", 1, 20, 5, 1, key="t3_topN")
+    with c2:
+        apply_day = st.selectbox("Apply Hedge", ["T", "T+1"], index=1, key="t3_apply_day")
+    with c3:
+        use_clusters = st.checkbox("Max 1 hedge per cluster per day", value=True, key="t3_cluster")
+    with c4:
+        min_obs_beta = st.number_input("Min obs for β(proxy|dtype)", 30, 300, 60, 5, key="t3_minbeta")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        tau1 = st.slider("τ1 → α=0.3", 0.0, 1.0, 0.50, 0.05, key="t3_tau1")
+    with d2:
+        tau2 = st.slider("τ2 → α=0.6", 0.0, 1.0, 0.70, 0.05, key="t3_tau2")
+    with d3:
+        tau3 = st.slider("τ3 → α=1.0", 0.0, 1.0, 0.85, 0.05, key="t3_tau3")
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        cost_rate = st.number_input("Rate cost / DV01 own", 0.0, 5.0, 0.20, 0.01, key="t3_c_rate")
+    with e2:
+        cost_xccy = st.number_input("XCCY cost / DV01 own", 0.0, 5.0, 0.25, 0.01, key="t3_c_xccy")
+    with e3:
+        cost_fx   = st.number_input("FX cost / FX01 own", 0.0, 5.0, 0.00, 0.01, key="t3_c_fx")
+
+    x1, x2 = st.columns(2)
+    with x1:
+        xccy_corr_min = st.slider("XCCY cross-hedge min |corr|", 0.0, 1.0, 0.40, 0.05, key="t3_corrmin")
+    with x2:
+        show_only = st.checkbox("Show only hedged days", value=False, key="t3_show_only")
+
+    # =========================================================
+    # C) HELPERS
+    # =========================================================
+    def _bucket(name):
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    factors = list(pnl_by_factor.columns)
+
+    # =========================================================
+    # D) α(t) FROM PCA STRESS
+    # =========================================================
+    def to_alpha(v):
+        if v < tau1: return 0.0
+        if v < tau2: return 0.3
+        if v < tau3: return 0.6
+        return 1.0
+
+    alpha = pca_stress_global.apply(to_alpha).rename("alpha")
+
+    figA, axA = plt.subplots(figsize=(12,3), dpi=120)
+    axA.plot(pca_stress_global.index, pca_stress_global.values, label="PCA_stress", lw=1)
+    axA2 = axA.twinx()
+    axA2.step(alpha.index, alpha.values, where="mid", color="tab:orange", label="α(t)")
+    axA.set_ylim(0,1.05)
+    axA2.set_ylim(0,1.05)
+    axA.set_title("PCA stress → α(t)")
+    auto_xticks(axA, pca_stress_global.index)
+    axA.legend(loc="upper left")
+    axA2.legend(loc="upper right")
+    st.pyplot(figA)
+
+    # =========================================================
+    # E) β(proxy|dtype)
+    # =========================================================
+    dF = pnl_by_factor.diff().dropna()
+    dD = mkt_change[dtype].reindex(dF.index).fillna(0.0)
+
+    eps = 1e-12
+    betas = {}
+
+    for c in factors:
+        df_xy = pd.concat([dD, dF[c]], axis=1).dropna()
+        if len(df_xy) < min_obs_beta:
+            betas[c] = 1.0
+            continue
+        X = df_xy.iloc[:,0].values
+        Y = df_xy.iloc[:,1].values
+        betas[c] = (X*Y).sum() / ((X**2).sum() + eps)
+
+    # CROSS-HEDGE XCCY
+    best_proxy_for_dtype = None
+    if _bucket(dtype)=="XCCY" and dtype in dF.columns:
+        corr_s = dF.corrwith(dF[dtype]).drop(index=dtype).dropna()
+        corr_s = corr_s[[c for c in corr_s.index if _bucket(c) in ("Rates","FX")]]
+        corr_abs = corr_s.abs()
+        corr_filt = corr_abs[corr_abs >= xccy_corr_min]
+        if len(corr_filt)>0:
+            best_proxy_for_dtype = corr_filt.idxmax()
+
+    # =========================================================
+    # F) PLAN DE HEDGE (DV01 OWN)
+    # =========================================================
+    st.markdown("### Hedge plan (DV01 own + β inverse)")
+
+    risk_ts_loc = (
+        risk_ts.reindex(base_index)
+               .reindex(columns=factors)
+               .fillna(0.0)
+    )
+
+    cost_series = pd.Series(0.0, index=base_index)
+    plan_rows = []
+
+    use_clusters_ok = use_clusters and isinstance(cluster_map, pd.Series)
+
+    if use_clusters_ok:
+        cluster_map = cluster_map.reindex(factors)
+
+    for d in base_index:
+        a_d = float(alpha.get(d,0.0))
+        if a_d<=0: 
+            continue
+
+        dv01_dtype_row = risk_ts_loc.loc[d].reindex(factors)
+
+        # score = |DV01| * α
+        score = abs(dv01_dtype_row)*a_d
+        score = score.replace([np.inf,-np.inf],0.0)
+
+        if use_clusters_ok:
+            top_names = []
+            used_cl = set()
+            cl_loc = cluster_map.dropna()
+            cluster_scores = {
+                int(cid): float(score[cl_loc[cl_loc==cid].index].max())
+                for cid in cl_loc.unique()
+            }
+
+            for c0 in score.sort_values(ascending=False).index:
+                if len(top_names)>=topN: break
+                if score[c0]<=0: continue
+                cid = cl_loc.get(c0,None)
+                if cid is None: continue
+                cid = int(cid)
+                if cluster_scores.get(cid,0)<=0: continue
+                if cid in used_cl: continue
+                top_names.append(c0)
+                used_cl.add(cid)
+        else:
+            top_names = score.sort_values(ascending=False).head(topN).index.tolist()
+
+        if not top_names:
+            continue
+
+        target_day = d if apply_day=="T" else d+pd.Timedelta(days=1)
+        if target_day not in base_index: 
+            continue
+
+        for c_target in top_names:
+            dv01_c_dtype = float(dv01_dtype_row[c_target])
+            if dv01_c_dtype==0 or not np.isfinite(dv01_c_dtype):
+                continue
+
+            # DV01 OWN du constituant = inverse beta_const
+            beta_const = betas.get(c_target,1.0)
+            if abs(beta_const)<1e-6: beta_const = 1.0
+            dv01_const_own = dv01_c_dtype / beta_const
+
+            used_proxy = c_target
+            beta_used = betas.get(c_target,1.0)
+
+            # Cross-hedge XCCY
+            if _bucket(dtype)=="XCCY" and c_target==dtype and (best_proxy_for_dtype is not None):
+                used_proxy = best_proxy_for_dtype
+                beta_used = betas.get(used_proxy,1.0)
+
+            if abs(beta_used)<1e-6: beta_used = 1.0
+
+            # DV01 OWN du proxy équivalent
+            dv01_proxy_own = dv01_c_dtype / beta_used
+
+            # Hedge sizing (OWN)
+            hedge_own = -a_d * dv01_proxy_own
+
+            # DV01 dtype reflété par ce hedge
+            hedge_dtype = hedge_own * beta_used  # = -α * DV01_const_dtype
+
+            bkt = _bucket(used_proxy)
+            unit_cost = cost_fx if bkt=="FX" else (cost_xccy if bkt=="XCCY" else cost_rate)
+
+            if np.isfinite(hedge_own):
+                cost_series.loc[target_day] += abs(hedge_own)*unit_cost
+
+            plan_rows.append({
+                "SignalDate": d,
+                "Date": target_day,
+                "Constituant_target": c_target,
+                "alpha": a_d,
+                "DV01_const_dtype": dv01_c_dtype,
+                "DV01_const_own": dv01_const_own,
+                "Proxy": used_proxy,
+                "Beta_const_vs_dtype": beta_const,
+                "Beta_proxy_vs_dtype": beta_used,
+                "DV01_proxy_own": dv01_proxy_own,
+                "HedgeUnits_own": hedge_own,
+                "HedgeUnits_dtype": hedge_dtype,
+                "Bucket": bkt,
+                "UnitCost": unit_cost,
+                "CostAlloc": abs(hedge_own)*unit_cost,
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    if plan_df.empty:
+        st.info("No hedge triggered.")
+    else:
+        df_show = plan_df.copy()
+        if show_only:
+            df_show = df_show[df_show["HedgeUnits_own"]!=0]
+        st.dataframe(
+            df_show.sort_values(["Date","Constituant_target","Proxy"])
+                   .style.format({
+                       "alpha":"{:.2f}",
+                       "DV01_const_dtype":"{:,.0f}",
+                       "DV01_const_own": "{:,.0f}",
+                       "Beta_const_vs_dtype":"{:.3f}",
+                       "Beta_proxy_vs_dtype":"{:.3f}",
+                       "DV01_proxy_own":"{:,.0f}",
+                       "HedgeUnits_own":"{:,.0f}",
+                       "HedgeUnits_dtype":"{:,.0f}",
+                       "UnitCost":"{:,.3f}",
+                       "CostAlloc":"{:,.0f}",
+                   }),
+            use_container_width=True, height=420
+        )
+
+    # =========================================================
+    # G) PNL — baseline vs hedged (same as Tab1)
+    # =========================================================
+    st.markdown("### PnL — Base vs Hedged")
+
+    E_base = (
+        cum_risk.reindex(base_index)
+                .reindex(columns=factors)
+                .fillna(0.0)
+    )
+
+    driver = (
+        mkt_change[dtype]
+        .reindex(base_index)
+        .fillna(0.0)
+    )
+
+    pnl_base = (E_base.shift(1).mul(driver, axis=0)).sum(axis=1)
+
+    if plan_df.empty:
+        H_dtype = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        hedge_delta = (
+            plan_df.groupby(["Date","Proxy"])["HedgeUnits_dtype"]
+                   .sum()
+                   .unstack(fill_value=0.0)
+                   .reindex(base_index, fill_value=0.0)
+        )
+        hedge_delta = hedge_delta.reindex(columns=factors,fill_value=0.0)
+        H_dtype = hedge_delta.cumsum()
+
+    E_tot = (E_base.add(H_dtype, fill_value=0.0)).shift(1).fillna(0.0)
+
+    pnl_after = (E_tot.mul(driver, axis=0)).sum(axis=1) - cost_series
+
+    cum_base  = pnl_base.cumsum()
+    cum_after = pnl_after.cumsum()
+
+    figF, axF = plt.subplots(figsize=(12,4), dpi=120)
+    axF.plot(cum_base.index, cum_base.values, label="Base")
+    axF.plot(cum_after.index, cum_after.values, label="Hedged")
+    axF.set_title("Cumulative PnL — Base vs Hedged")
+    axF.legend()
+    auto_xticks(axF, cum_base.index)
+    st.pyplot(figF)
+
+    k1, k2, k3 = st.columns(3)
+    with k1: st.metric("Δ Cumul", f"{float(cum_after.iloc[-1]-cum_base.iloc[-1]):,.0f}")
+    with k2: st.metric("Hedge cost", f"{float(cost_series.sum()):,.0f}")
+    with k3: st.metric("% hedged days", f"{100*(alpha>0).mean():.1f}%")
