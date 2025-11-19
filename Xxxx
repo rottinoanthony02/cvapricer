@@ -1,0 +1,68 @@
+    # =========================================================
+    # G) PNL — BASE vs HEDGED (baseline = net_daily)
+    # =========================================================
+    st.markdown("### PnL — Base vs Hedged (baseline = net_daily)")
+
+    # 1) Baseline PnL = net_daily (Tab 1)
+    pnl_base = (
+        net_daily
+        .reindex(base_index)
+        .fillna(0.0)
+        .rename("PnL_baseline")
+    )
+
+    # 2) Driver du hedge = même data-type que Tab 1
+    driver_series = (
+        mkt_change[dtype]
+        .reindex(base_index)
+        .fillna(0.0)
+    )
+
+    # 3) Hedge cumulé en DV01 dtype (déjà calculé dans plan_df)
+    if plan_df.empty:
+        H_dtype = pd.DataFrame(0.0, index=base_index, columns=factors)
+    else:
+        hedge_delta = (
+            plan_df.groupby(["Date","Proxy"])["HedgeUnits_dtype"]
+                   .sum()
+                   .unstack(fill_value=0.0)
+                   .reindex(base_index, fill_value=0.0)
+        )
+        hedge_delta = hedge_delta.reindex(columns=factors, fill_value=0.0)
+        H_dtype = hedge_delta.cumsum()
+
+    # 4) PnL du hedge = seulement la contribution des positions de hedge
+    #    (on ne retouche pas ce qui a déjà produit net_daily)
+    H_shift = H_dtype.shift(1).fillna(0.0)
+
+    pnl_hedge = (H_shift.mul(driver_series, axis=0)).sum(axis=1)
+    pnl_hedge = pnl_hedge.sub(
+        cost_series.reindex(base_index).fillna(0.0),
+        fill_value=0.0
+    ).rename("PnL_hedge")
+
+    # 5) PnL après hedge = net_daily + overlay hedge
+    pnl_after = (pnl_base.add(pnl_hedge, fill_value=0.0)).rename("PnL_after")
+
+    # 6) Cumulés
+    cum_base  = pnl_base.cumsum().rename("Cum_Base")
+    cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+    figF, axF = plt.subplots(figsize=(12,4), dpi=120)
+    axF.plot(cum_base.index, cum_base.values, label="Cumul Base (net_daily)")
+    axF.plot(cum_after.index, cum_after.values, label="Cumul Hedged (Tab 3)")
+    auto_xticks(axF, cum_base.index)
+    format_yaxis_plain(axF)
+    axF.set_title("Cumulative PnL — Base (Tab1) vs Hedged (Tab3)")
+    axF.legend(loc="upper left")
+    st.pyplot(figF)
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("Δ Cumul (Hedged - Base)",
+                  f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+    with k2:
+        st.metric("Hedge cost total", f"{float(cost_series.sum()):,.0f}")
+    with k3:
+        pct_days = 100.0 * float((alpha > 0).mean())
+        st.metric("% jours couverts (α>0)", f"{pct_days:.1f}%")
