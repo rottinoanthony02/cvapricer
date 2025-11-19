@@ -1,0 +1,448 @@
+with tab4:
+    st.subheader("TAB 4 — Prédiction de stress + SHAP + Sélection auto de features")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from hmmlearn.hmm import GaussianHMM
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.ensemble import GradientBoostingClassifier
+    from sklearn.metrics import accuracy_score, roc_auc_score
+    import shap
+
+    # =========================
+    # 1) PARAMÈTRES UTILISATEUR
+    # =========================
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        stress_thr = st.slider("Seuil de stress PCA (max cluster = 1)", 0.0, 1.0, 0.7, 0.05, key="tab4_stress_thr")
+    with c2:
+        train_frac = st.slider("Fraction de données en train", 0.5, 0.95, 0.75, 0.05, key="tab4_train_frac")
+    with c3:
+        horizon = st.number_input("Horizon de prévision (jours)", 1, 5, 1, 1, key="tab4_horizon")
+
+    base_index = pnl_by_factor.index
+    factors = list(pnl_by_factor.columns)
+    eps = 1e-12
+    h = int(horizon)
+
+    # Récupérer seuils de Tab3 si dispo pour mapping proba → α
+    tau1 = st.session_state.get("tab3_tau1", 0.50)
+    tau2 = st.session_state.get("tab3_tau2", 0.70)
+    tau3 = st.session_state.get("tab3_tau3", 0.85)
+
+    # =========================
+    # 2) CLUSTERS & PCA STRESS
+    # =========================
+
+    # Essayer de récupérer cluster_map de Tab3, sinon fallback
+    try:
+        cluster_map_tab3 = st.session_state.get("tab3_cluster_map", None)
+        if cluster_map_tab3 is not None:
+            cluster_map = cluster_map_tab3
+    except NameError:
+        pass
+
+    try:
+        _ = cluster_map
+    except NameError:
+        cluster_map = None
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    if (cluster_map is None) or (cluster_map.dropna().empty):
+        cluster_map_local = pd.Series(1, index=factors)
+    else:
+        cluster_map_local = cluster_map.reindex(factors).fillna(1).astype(int)
+
+    cl_ids = sorted(cluster_map_local.unique())
+
+    # ΔPnL par facteur
+    dPnL = pnl_by_factor.diff().replace([np.inf, -np.inf], np.nan)
+
+    # PCA-stress cluster (PC1)
+    pca_stress_cluster = pd.DataFrame(0.0, index=base_index, columns=cl_ids)
+
+    for cid in cl_ids:
+        cols_c = cluster_map_local[cluster_map_local == cid].index.tolist()
+        if len(cols_c) < 2:
+            continue
+        X_c = dPnL[cols_c].dropna(how="any")
+        if len(X_c) < 30:
+            continue
+        pca = PCA(n_components=1, random_state=42)
+        scores = pca.fit_transform(X_c.values).ravel()
+        scores = pd.Series(scores, index=X_c.index)
+        z = (scores - scores.mean()) / (scores.std(ddof=1) + eps)
+        stress = (z.abs() / 3.0).clip(0.0, 1.0)
+        pca_stress_cluster[cid] = stress.reindex(base_index).ffill().fillna(0.0)
+
+    pca_stress_max = pca_stress_cluster.max(axis=1).rename("PCA_stress_max")
+    pca_stress_mean = pca_stress_cluster.mean(axis=1).rename("PCA_stress_mean")
+
+    # =========================
+    # 3) HMM PROBA STRESS (FEATURE)
+    # =========================
+    X_df = pnl_by_factor.replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    idx_obs = X_df.index
+
+    scaler = StandardScaler()
+    X_use = scaler.fit_transform(X_df.values)
+
+    hmm_states_tab4 = 3
+    hmm_tab4 = GaussianHMM(
+        n_components=hmm_states_tab4,
+        covariance_type="full",
+        n_iter=300,
+        random_state=42
+    )
+    hmm_tab4.fit(X_use)
+
+    states_tab4 = pd.Series(hmm_tab4.predict(X_use), index=idx_obs, name="state")
+    post_tab4 = pd.DataFrame(
+        hmm_tab4.predict_proba(X_use),
+        index=idx_obs,
+        columns=[f"Regime {i}" for i in range(hmm_states_tab4)]
+    )
+
+    net_on_state = pd.concat([net_daily.reindex(idx_obs), states_tab4], axis=1).dropna()
+    means_by_state = net_on_state.groupby("state")["NetDailyPnL"].mean()
+    stress_regime = int(means_by_state.idxmin()) if len(means_by_state) > 0 else 0
+
+    hmm_p_stress = post_tab4.iloc[:, stress_regime].reindex(base_index).ffill().fillna(0.0)
+    hmm_p_stress = hmm_p_stress.rename("HMM_p_stress")
+
+    # =========================
+    # 4) FEATURES AVANCÉES
+    # =========================
+
+    # move du data type
+    dD = mkt_change[dtype].reindex(base_index).diff().fillna(0.0).rename("dM_dtype")
+
+    # 1) Vol du driver
+    vol5  = dD.rolling(5).std().rename("vol5")
+    vol20 = dD.rolling(20).std().rename("vol20")
+    vol_ratio = (vol5 / (vol20 + 1e-12)).rename("vol_ratio")
+
+    # 2) z-move
+    zmove = (dD / (vol20 + 1e-12)).rename("zmove")
+
+    # 3) PCA2 par cluster
+    pca2_cluster = pd.DataFrame(0.0, index=base_index, columns=cl_ids)
+    for cid in cl_ids:
+        cols_c = cluster_map_local[cluster_map_local == cid].index.tolist()
+        if len(cols_c) < 3:
+            continue
+        X_c = dPnL[cols_c].dropna()
+        if len(X_c) < 40:
+            continue
+        pca_full = PCA(n_components=2, random_state=42)
+        scores = pca_full.fit_transform(X_c.values)
+        pc2_raw = scores[:, 1]
+        pc2_z = (pc2_raw - pc2_raw.mean()) / (pc2_raw.std(ddof=1) + 1e-12)
+        pca2_cluster[cid] = pd.Series(pc2_z, index=X_c.index).reindex(base_index).fillna(0.0)
+
+    pca2_max = pca2_cluster.abs().max(axis=1).rename("PCA2_max")
+
+    # 4) Corr global ΔPnL (statique)
+    corr_m = dPnL.corr().abs()
+    corr_global_val = corr_m.mean().mean()
+    corr_series = pd.Series(corr_global_val, index=base_index, name="corr_global")  # constant
+
+    # 5) Total DV01 & concentration
+    dv01_snapshot = (
+        risk_ts.reindex(base_index)
+               .reindex(columns=factors)
+               .fillna(0.0)
+    )
+    dv01_tot = dv01_snapshot.abs().sum(axis=1).rename("DV01_total")
+
+    w = dv01_snapshot.abs().div(dv01_snapshot.abs().sum(axis=1), axis=0).replace([np.inf, -np.inf], 0.0)
+    herfindahl = (w**2).sum(axis=1).rename("concentration_DV01")
+
+    # 6) Steepener si dispo
+    try:
+        steep = (mkt_change["30Y"] - mkt_change["2Y"]).diff().fillna(0.0).rename("steepener")
+    except Exception:
+        steep = pd.Series(0.0, index=base_index, name="steepener")
+
+    # 7) Momentum du stress PCA
+    stress_mom = (pca_stress_max - pca_stress_max.shift(5)).fillna(0.0).rename("stress_momentum")
+
+    # FEATURE SET FINAL
+    feature_df = pd.concat([
+        dD,
+        pca_stress_max,
+        pca_stress_mean,
+        pca2_max,
+        hmm_p_stress,
+        vol5, vol20, vol_ratio,
+        zmove,
+        dv01_tot,
+        herfindahl,
+        steep,
+        stress_mom,
+        corr_series,
+    ], axis=1).dropna()
+
+    # =========================
+    # 5) TARGET FUTURE : STRESS T+h
+    # =========================
+    stress_flag = (pca_stress_max >= stress_thr).astype(int).reindex(feature_df.index)
+    y_future = stress_flag.shift(-h).dropna()
+    X_all = feature_df.loc[y_future.index]
+
+    if len(X_all) < 100:
+        st.warning("Pas assez d'observations pour entraîner un modèle de prédiction robuste (n<100).")
+    else:
+        # Split chronologique
+        n = len(X_all)
+        n_train = int(n * float(train_frac))
+        X_train, y_train = X_all.iloc[:n_train], y_future.iloc[:n_train]
+        X_test,  y_test  = X_all.iloc[n_train:], y_future.iloc[n_train:]
+
+        # =========================
+        # 6) PREMIER MODELE (FULL FEATURES)
+        # =========================
+        clf0 = GradientBoostingClassifier(random_state=42)
+        clf0.fit(X_train, y_train)
+
+        y_pred_test0 = clf0.predict(X_test)
+        y_proba_test0 = clf0.predict_proba(X_test)[:, 1]
+        acc_test0 = float(accuracy_score(y_test, y_pred_test0))
+        try:
+            auc_test0 = float(roc_auc_score(y_test, y_proba_test0))
+        except ValueError:
+            auc_test0 = np.nan
+
+        st.markdown("### Performance brute (avant sélection SHAP)")
+        c1m, c2m = st.columns(2)
+        with c1m:
+            st.metric("Accuracy test (full features)", f"{acc_test0*100:.1f}%")
+        with c2m:
+            st.metric("AUC test (full features)", f"{auc_test0:.3f}" if np.isfinite(auc_test0) else "n/a")
+
+        # =========================
+        # 7) SHAP GLOBAL & SÉLECTION AUTO
+        # =========================
+        st.markdown("### Sélection automatique de features via SHAP")
+
+        bg = X_train.sample(n=min(200, len(X_train)), random_state=42)
+        expl0 = shap.TreeExplainer(clf0)
+        shap_values_bg = expl0.shap_values(bg)  # (n_samples, n_features)
+
+        shap_importance = np.abs(shap_values_bg).mean(axis=0)
+        shap_df = (
+            pd.DataFrame({
+                "Feature": X_train.columns,
+                "SHAP_importance": shap_importance
+            })
+            .sort_values("SHAP_importance", ascending=False)
+            .set_index("Feature")
+        )
+
+        p_keep = st.slider("Seuil relatif SHAP (p * max)", 0.1, 0.9, 0.3, 0.05, key="tab4_shap_threshold")
+        max_shap = float(shap_df["SHAP_importance"].max())
+        sel = shap_df[shap_df["SHAP_importance"] >= p_keep * max_shap].index.tolist()
+        if len(sel) < 3:
+            sel = shap_df.head(3).index.tolist()
+
+        st.write("Features retenues automatiquement :")
+        st.write(sel)
+
+        with st.expander("Table SHAP globale (full features)", expanded=False):
+            st.dataframe(
+                shap_df.style.format({"SHAP_importance": "{:.5f}"}),
+                use_container_width=True,
+                height=320
+            )
+            # petit bar chart top 10
+            topN_shap = shap_df.head(10)
+            fig_shap, ax_shap = plt.subplots(figsize=(6,4), dpi=120)
+            ax_shap.barh(topN_shap.index[::-1], topN_shap["SHAP_importance"][::-1])
+            ax_shap.set_xlabel("Importance moyenne absolue (|SHAP|)")
+            ax_shap.set_title("Top 10 features — SHAP importance")
+            st.pyplot(fig_shap)
+
+        # =========================
+        # 8) MODELE FINAL SUR FEATURES SÉLECTIONNÉES
+        # =========================
+        X_train_fs = X_train[sel]
+        X_test_fs  = X_test[sel]
+
+        clf = GradientBoostingClassifier(random_state=42)
+        clf.fit(X_train_fs, y_train)
+
+        y_pred_test = clf.predict(X_test_fs)
+        y_proba_test = clf.predict_proba(X_test_fs)[:, 1]
+        acc_test = float(accuracy_score(y_test, y_pred_test))
+        try:
+            auc_test = float(roc_auc_score(y_test, y_proba_test))
+        except ValueError:
+            auc_test = np.nan
+
+        st.markdown("### Performance après sélection SHAP")
+        c1m2, c2m2 = st.columns(2)
+        with c1m2:
+            st.metric("Accuracy test (features SHAP)", f"{acc_test*100:.1f}%")
+        with c2m2:
+            st.metric("AUC test (features SHAP)", f"{auc_test:.3f}" if np.isfinite(auc_test) else "n/a")
+
+        # Probas sur tout l'historique utilisable
+        X_fs_all = X_all[sel]
+        proba_all = clf.predict_proba(X_fs_all)[:, 1]
+        proba_series = pd.Series(proba_all, index=X_fs_all.index, name="P_pred_stress_T+h")
+
+        # =========================
+        # 9) α_future(t) = f(P_pred)
+        # =========================
+        def _map_p_to_alpha(p):
+            if p < tau1:  return 0.0
+            if p < tau2:  return 0.3
+            if p < tau3:  return 0.6
+            return 1.0
+
+        alpha_future = pd.Series(0.0, index=base_index, name="alpha_future")
+        for d in proba_series.index:
+            alpha_future.loc[d] = _map_p_to_alpha(proba_series.loc[d])
+
+        st.markdown(f"### P(stress T+{h}) & α_future basés sur modèle filtré")
+
+        last_date = proba_series.index[-1]
+        last_p = float(proba_series.iloc[-1])
+        last_alpha = float(alpha_future.loc[last_date])
+
+        c1p, c2p = st.columns(2)
+        with c1p:
+            st.metric(f"Dernière P(stress T+{h})", f"{last_p*100:.1f}%")
+        with c2p:
+            st.metric("α_future (dernier jour)", f"{last_alpha:.2f}")
+
+        figS, axS = plt.subplots(figsize=(12,4), dpi=120)
+        axS.plot(proba_series.index, proba_series.values, label="P_pred_stress(T+h)", lw=1.1)
+        axS.plot(alpha_future.loc[proba_series.index].index,
+                 alpha_future.loc[proba_series.index].values,
+                 label="α_future (discrétisé)", lw=0.9)
+        auto_xticks(axS, proba_series.index)
+        axS.set_ylim(-0.05, 1.05)
+        axS.set_title(f"Prévision de stress & α_future (h={h})")
+        axS.legend(loc="upper left")
+        st.pyplot(figS)
+
+        # =========================
+        # 10) SHAP LOCAL — DATE CHOISIE
+        # =========================
+        st.markdown("### Explication locale (SHAP) pour une date donnée")
+
+        explainer = shap.TreeExplainer(clf)
+
+        dates_disp = list(X_fs_all.index)
+        idx_default = len(dates_disp) - 1
+
+        date_choice = st.selectbox(
+            "Choisir la date à expliquer",
+            options=dates_disp,
+            index=idx_default,
+            format_func=lambda d: d.strftime("%Y-%m-%d"),
+            key="tab4_shap_date_choice"
+        )
+
+        x_chosen = X_fs_all.loc[[date_choice]]
+        shap_chosen = explainer.shap_values(x_chosen)[0]
+        p_pred_chosen = float(clf.predict_proba(x_chosen)[:, 1][0])
+
+        contrib_df = pd.DataFrame({
+            "Feature": X_fs_all.columns,
+            "Valeur": x_chosen.values[0],
+            "SHAP_contrib": shap_chosen
+        }).set_index("Feature").sort_values("SHAP_contrib", ascending=False)
+
+        top_pos = contrib_df.head(5)
+        top_neg = contrib_df.tail(5)
+        contrib_view = pd.concat([top_pos, top_neg])
+
+        st.write(f"Date expliquée : **{date_choice.date()}** — P_pred_stress(T+{h}) = **{p_pred_chosen*100:.1f}%**")
+
+        st.dataframe(
+            contrib_view.style.format({
+                "Valeur": "{:.4f}",
+                "SHAP_contrib": "{:.4f}",
+            }),
+            use_container_width=True,
+            height=320
+        )
+
+        fig_loc, ax_loc = plt.subplots(figsize=(6,4), dpi=120)
+        ax_loc.barh(contrib_view.index[::-1], contrib_view["SHAP_contrib"][::-1])
+        ax_loc.set_xlabel("Contribution SHAP à la probabilité de stress")
+        ax_loc.set_title(f"Top ± features — explication locale ({date_choice.date()})")
+        st.pyplot(fig_loc)
+
+        # =========================
+        # 11) HEDGE D'ANTICIPATION SIMPLE (RECO JOUR COURANT)
+        # =========================
+        st.markdown("### Hedge d’anticipation (reco bucket globale aujourd'hui)")
+
+        # DV01 actuelle
+        dv01_current = (
+            risk_ts.reindex(base_index)
+                   .reindex(columns=factors)
+                   .iloc[-1]
+                   .fillna(0.0)
+        )
+
+        buckets_series = dv01_current.index.to_series().apply(_bucket)
+        dv01_by_bucket = dv01_current.groupby(buckets_series).sum()
+
+        alpha_today = float(alpha_future.loc[last_date])
+
+        hedge_rows_fc = []
+        for bkt, dv01_b in dv01_by_bucket.items():
+            if dv01_b == 0.0:
+                continue
+
+            dv01_hedge_dtype = - alpha_today * dv01_b
+
+            if bkt == "Rates":
+                unit_cost = st.session_state.get("tab3_cost_rate", 0.20)
+            elif bkt == "XCCY":
+                unit_cost = st.session_state.get("tab3_cost_xccy", 0.25)
+            else:
+                unit_cost = st.session_state.get("tab3_cost_fx", 0.00)
+
+            hedge_cost = abs(dv01_hedge_dtype) * unit_cost
+
+            hedge_rows_fc.append({
+                "Bucket": bkt,
+                "DV01_current_dtype": dv01_b,
+                "DV01_hedge_dtype": dv01_hedge_dtype,
+                "UnitCost": unit_cost,
+                "Cost_estimee": hedge_cost
+            })
+
+        if hedge_rows_fc:
+            hedge_fc_df = pd.DataFrame(hedge_rows_fc).set_index("Bucket")
+            st.dataframe(
+                hedge_fc_df.style.format({
+                    "DV01_current_dtype": "{:,.0f}",
+                    "DV01_hedge_dtype": "{:,.0f}",
+                    "UnitCost": "{:.3f}",
+                    "Cost_estimee": "{:,.0f}",
+                }),
+                use_container_width=True,
+                height=260
+            )
+        else:
+            st.info("DV01 actuelle nulle ou α_future=0 ⇒ aucun hedge d’anticipation proposé.")
+
+        # Expose éventuellement pour d'autres tabs (combo/backtest)
+        st.session_state["tab4_alpha_future"] = alpha_future
+        st.session_state["tab4_P_pred_stress"] = proba_series
+        st.session_state["tab4_features_selected"] = sel
